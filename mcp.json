@@ -1,0 +1,88 @@
+{
+  "name": "mysql-mcp-server",
+  "description": "Expert MySQL MCP Server with intelligent analytics and user behavior analysis capabilities",
+  "version": "1.0.0",
+  "author": "ttpears",
+  "license": "MIT",
+  "homepage": "https://github.com/ttpears/mcp-mysql",
+  "repository": "https://github.com/ttpears/mcp-mysql.git",
+  "categories": ["database", "analytics", "business-intelligence"],
+  "tags": ["mysql", "sql", "analytics", "user-behavior", "data-analysis", "business-intelligence"],
+  "runtime": "node",
+  "language": "typescript",
+  "main": "dist/index.js",
+  "build": "npm run build",
+  "start": "npm start",
+  "requirements": {
+    "node": ">=18.0.0",
+    "mysql": ">=5.5.0"
+  },
+  "environment": [
+    {
+      "name": "MYSQL_HOST",
+      "description": "MySQL server hostname",
+      "default": "localhost",
+      "required": false
+    },
+    {
+      "name": "MYSQL_PORT", 
+      "description": "MySQL server port",
+      "default": "3306",
+      "required": false
+    },
+    {
+      "name": "MYSQL_USER",
+      "description": "MySQL username",
+      "default": "root",
+      "required": false
+    },
+    {
+      "name": "MYSQL_PASSWORD",
+      "description": "MySQL password",
+      "required": true
+    },
+    {
+      "name": "MYSQL_DATABASE",
+      "description": "MySQL database name",
+      "required": true
+    },
+    {
+      "name": "MYSQL_SSL",
+      "description": "Enable SSL connection",
+      "default": "false",
+      "required": false
+    }
+  ],
+  "tools": [
+    {
+      "name": "mysql_discover_analytics",
+      "description": "🚀 START HERE - Intelligently discover and analyze database structure with expert insights",
+      "category": "discovery"
+    },
+    {
+      "name": "mysql_query",
+      "description": "Execute read-only SQL queries with performance analytics",
+      "category": "query"
+    },
+    {
+      "name": "mysql_schema", 
+      "description": "Get comprehensive schema information with relationships and data patterns",
+      "category": "schema"
+    },
+    {
+      "name": "mysql_analyze_tables",
+      "description": "Analyze table relationships for user behavior and analytics patterns",
+      "category": "analysis"
+    }
+  ],
+  "features": [
+    "🧠 Intelligent database discovery and classification",
+    "📊 Expert analytics insights and recommendations", 
+    "🔍 Comprehensive relationship mapping",
+    "⚡ Query performance analysis and optimization",
+    "👥 User behavior analysis specialization",
+    "🏗️ Automatic fact/dimension table detection",
+    "📈 Ready-to-use analytics query templates",
+    "🔒 Read-only security with query validation"
+  ]
+}
