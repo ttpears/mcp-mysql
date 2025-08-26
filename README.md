@@ -7,14 +7,15 @@ An intelligent MySQL MCP Server with expert data analytics capabilities. Goes be
 
 ## Features
 
-- **Read-only queries**: Execute SELECT, SHOW, DESCRIBE, and EXPLAIN statements
-- **Advanced schema analysis**: Comprehensive table inspection with relationships and constraints
-- **User behavior analysis**: Intelligent detection of user, time, and behavior columns
-- **Relationship mapping**: Automatic discovery of table relationships and join suggestions
-- **Data profiling**: Sample data analysis with value distributions and statistics
-- **Query recommendations**: AI-friendly suggestions for complex user behavior queries
-- **Security**: Query validation, length limits, and connection timeouts
-- **Performance**: Connection reuse and query execution metadata
+- **🌐 Multi-database server support**: Connect to entire MySQL servers or specific databases
+- **🧠 Intelligent discovery**: Automatic database and table classification with expert insights
+- **📊 Advanced analytics**: Comprehensive schema analysis with relationships and constraints
+- **👥 User behavior specialization**: Smart detection of user, time, and behavior patterns
+- **🔄 Cross-database analysis**: Relationship mapping and insights across multiple databases
+- **📈 Ready-to-use queries**: AI-generated analytics templates for common patterns
+- **⚡ Performance optimization**: Query analysis with execution insights and recommendations
+- **🔒 Enterprise security**: Read-only access with query validation and connection timeouts
+- **🏗️ Architecture detection**: Automatic identification of star schemas and data warehouse patterns
 - **MySQL 5.5+ compatible**: Works with MySQL 5.5 and later versions
 
 ## Quick Start
@@ -27,6 +28,13 @@ cd mcp-mysql
 npm install && npm run build
 
 # Add to Claude Code with your MySQL credentials
+# For server-wide access (recommended):
+claude mcp add mysql-server npm start \
+  -e MYSQL_HOST=localhost \
+  -e MYSQL_USER=your_user \
+  -e MYSQL_PASSWORD=your_password
+
+# For single database access:
 claude mcp add mysql-server npm start \
   -e MYSQL_HOST=localhost \
   -e MYSQL_USER=your_user \
@@ -55,11 +63,19 @@ Set the following environment variables:
 | `MYSQL_PORT` | `3306` | MySQL server port |
 | `MYSQL_USER` | `root` | MySQL username |
 | `MYSQL_PASSWORD` | `` | MySQL password |
-| `MYSQL_DATABASE` | `test` | MySQL database name |
+| `MYSQL_DATABASE` | _(none)_ | MySQL database name (optional - if not set, provides server-wide access) |
 | `MYSQL_SSL` | `false` | Enable SSL connection |
 
-Example:
+Examples:
 ```bash
+# Server-wide access (recommended for analytics)
+export MYSQL_HOST=localhost
+export MYSQL_PORT=3306
+export MYSQL_USER=analytics_user
+export MYSQL_PASSWORD=your_password
+export MYSQL_SSL=true
+
+# Single database access
 export MYSQL_HOST=localhost
 export MYSQL_PORT=3306
 export MYSQL_USER=readonly_user
@@ -150,33 +166,42 @@ Analyze table relationships and suggest optimal query patterns for user behavior
 ```
 
 #### `mysql_discover_analytics`
-**🚀 START HERE** - Intelligently discover and analyze your entire database with expert data analytics insights.
+**🚀 START HERE** - Intelligently discover and analyze your entire MySQL server with expert data analytics insights.
 
 **Parameters:**
+- `databases` (array, optional): List of databases to analyze (if not specified, discovers all accessible databases)
 - `focus_area` (string, optional): Analytics focus ('user_behavior', 'sales_analytics', 'engagement', 'general')
 - `include_recommendations` (boolean, default: true): Include expert query recommendations
+- `cross_database_analysis` (boolean, default: true): Analyze relationships across databases
 
 **Examples:**
 ```json
-// Comprehensive database discovery for user behavior analysis
+// Discover entire MySQL server for user behavior analysis
 {
   "focus_area": "user_behavior",
-  "include_recommendations": true
+  "cross_database_analysis": true
 }
 
-// General database analysis
+// Analyze specific databases only
+{
+  "databases": ["ecommerce", "analytics", "logs"],
+  "focus_area": "sales_analytics"
+}
+
+// Quick server overview
 {
   "focus_area": "general"
 }
 ```
 
 **What you get:**
-- Complete database structure analysis with all executed SQL queries shown
-- Intelligent table classification (fact tables, dimension tables, user tables, event tables)
-- Relationship mapping and foreign key analysis  
-- Expert analytics insights and performance recommendations
-- Ready-to-use SQL queries for common analytics patterns
-- Data quality assessments and optimization suggestions
+- 🌐 Complete multi-database server analysis with all executed SQL queries shown
+- 🧠 Intelligent table classification across all databases (fact tables, dimension tables, user tables, event tables)
+- 🔄 Cross-database relationship mapping and pattern detection
+- 📊 Expert analytics insights and performance recommendations per database
+- 📈 Ready-to-use SQL queries for cross-database analytics patterns
+- 🔍 Data quality assessments and optimization suggestions
+- 🏗️ Architecture analysis (star schema detection, data warehouse patterns)
 
 ## Security Features
 

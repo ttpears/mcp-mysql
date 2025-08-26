@@ -1,7 +1,7 @@
 {
   "name": "mysql-mcp-server",
   "description": "Expert MySQL MCP Server with intelligent analytics and user behavior analysis capabilities",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "author": "ttpears",
   "license": "MIT",
   "homepage": "https://github.com/ttpears/mcp-mysql",
@@ -43,8 +43,8 @@
     },
     {
       "name": "MYSQL_DATABASE",
-      "description": "MySQL database name",
-      "required": true
+      "description": "MySQL database name (optional - if not set, provides access to all databases on the server)",
+      "required": false
     },
     {
       "name": "MYSQL_SSL",
@@ -76,13 +76,15 @@
     }
   ],
   "features": [
-    "🧠 Intelligent database discovery and classification",
+    "🌐 Multi-database server support with automatic discovery",
+    "🧠 Intelligent database and table classification",
     "📊 Expert analytics insights and recommendations", 
-    "🔍 Comprehensive relationship mapping",
+    "🔍 Comprehensive relationship mapping across databases",
     "⚡ Query performance analysis and optimization",
     "👥 User behavior analysis specialization",
     "🏗️ Automatic fact/dimension table detection",
     "📈 Ready-to-use analytics query templates",
+    "🔄 Cross-database relationship analysis",
     "🔒 Read-only security with query validation"
   ]
 }

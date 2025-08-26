@@ -20,7 +20,7 @@ interface ConnectionConfig {
   port: number;
   user: string;
   password: string;
-  database: string;
+  database?: string; // Optional - if not provided, connects to server with access to all databases
   ssl?: mysql.SslOptions | string;
 }
 
@@ -47,26 +47,37 @@ class MySQLMCPServer {
       port: parseInt(process.env.MYSQL_PORT || '3306'),
       user: process.env.MYSQL_USER || 'root',
       password: process.env.MYSQL_PASSWORD || '',
-      database: process.env.MYSQL_DATABASE || 'test',
+      database: process.env.MYSQL_DATABASE, // Optional - undefined means server-wide access
       ssl: process.env.MYSQL_SSL === 'true' ? {} : undefined
     };
 
     this.setupHandlers();
   }
 
-  private async createConnection(): Promise<mysql.Connection> {
-    if (!this.connection) {
+  private async createConnection(database?: string): Promise<mysql.Connection> {
+    // Create new connection if we need a different database or don't have one
+    const targetDb = database || this.config.database;
+    
+    if (!this.connection || (targetDb && this.connection.config.database !== targetDb)) {
       try {
-        this.connection = await mysql.createConnection({
+        const connectionConfig = {
           ...this.config,
           timezone: 'Z',
           dateStrings: true,
           supportBigNumbers: true,
           bigNumberStrings: true,
           connectTimeout: 10000
-        });
+        };
         
+        // Only set database if specified
+        if (targetDb) {
+          connectionConfig.database = targetDb;
+        }
+        
+        this.connection = await mysql.createConnection(connectionConfig);
         await this.connection.ping();
+        
+        console.error(`Connected to MySQL server${targetDb ? ` (database: ${targetDb})` : ' (server-wide access)'}`);
       } catch (error) {
         console.error('Database connection failed:', error);
         throw new Error(`Cannot connect to MySQL: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -86,18 +97,22 @@ class MySQLMCPServer {
       const tools: Tool[] = [
         {
           name: 'mysql_query',
-          description: 'Execute a read-only SQL query against the MySQL database. Supports SELECT, SHOW, DESCRIBE, and EXPLAIN statements.',
+          description: 'Execute a read-only SQL query against MySQL databases. Supports SELECT, SHOW, DESCRIBE, and EXPLAIN statements.',
           inputSchema: {
             type: 'object',
             properties: {
               query: {
                 type: 'string',
-                description: 'The SQL query to execute (read-only operations only)'
+                description: 'The SQL query to execute (read-only operations only). Use database.table syntax for cross-database queries.'
               },
               params: {
                 type: 'array',
                 description: 'Optional array of parameters for prepared statement',
                 items: { type: 'string' }
+              },
+              database: {
+                type: 'string',
+                description: 'Optional database name to connect to for this query'
               }
             },
             required: ['query']
@@ -109,9 +124,13 @@ class MySQLMCPServer {
           inputSchema: {
             type: 'object',
             properties: {
+              database: {
+                type: 'string',
+                description: 'Database name to analyze (if not specified, analyzes current/default database)'
+              },
               table: {
                 type: 'string',
-                description: 'Optional table name to get specific table analysis'
+                description: 'Optional table name to get specific table analysis (use database.table for cross-database)'
               },
               include_relationships: {
                 type: 'boolean',
@@ -154,10 +173,15 @@ class MySQLMCPServer {
         },
         {
           name: 'mysql_discover_analytics',
-          description: 'Intelligently discover and analyze database structure with expert data analytics insights. Always start with this for new databases.',
+          description: 'Intelligently discover and analyze database structure with expert data analytics insights. Always start with this for new servers.',
           inputSchema: {
             type: 'object',
             properties: {
+              databases: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Optional list of databases to analyze (if not specified, discovers all accessible databases)'
+              },
               focus_area: {
                 type: 'string',
                 enum: ['user_behavior', 'sales_analytics', 'engagement', 'general'],
@@ -167,6 +191,11 @@ class MySQLMCPServer {
               include_recommendations: {
                 type: 'boolean',
                 description: 'Include expert analytics recommendations and queries',
+                default: true
+              },
+              cross_database_analysis: {
+                type: 'boolean',
+                description: 'Analyze relationships across databases',
                 default: true
               }
             }
@@ -218,7 +247,7 @@ class MySQLMCPServer {
       throw new Error('Query too long (max 10,000 characters)');
     }
 
-    const connection = await this.createConnection();
+    const connection = await this.createConnection(args.database);
     
     try {
       const startTime = Date.now();
@@ -255,19 +284,26 @@ class MySQLMCPServer {
   }
 
   private async handleSchema(args: any) {
-    const connection = await this.createConnection();
+    const connection = await this.createConnection(args?.database);
     const includeRelationships = args?.include_relationships !== false;
     const includeSampleData = args?.include_sample_data === true;
     const sampleSize = Math.min(args?.sample_size || 100, 1000);
+    const targetDatabase = args?.database || this.config.database;
     
     if (args?.table) {
-      return await this.getDetailedTableSchema(connection, args.table, includeRelationships, includeSampleData, sampleSize);
+      // Handle database.table format
+      let tableName = args.table;
+      let dbName = targetDatabase;
+      if (tableName.includes('.')) {
+        [dbName, tableName] = tableName.split('.', 2);
+      }
+      return await this.getDetailedTableSchema(connection, tableName, dbName, includeRelationships, includeSampleData, sampleSize);
     } else {
-      return await this.getDatabaseOverview(connection, includeRelationships);
+      return await this.getDatabaseOverview(connection, targetDatabase, includeRelationships);
     }
   }
 
-  private async getDetailedTableSchema(connection: mysql.Connection, tableName: string, includeRelationships: boolean, includeSampleData: boolean, sampleSize: number) {
+  private async getDetailedTableSchema(connection: mysql.Connection, tableName: string, databaseName: string | undefined, includeRelationships: boolean, includeSampleData: boolean, sampleSize: number) {
     const [columns] = await connection.execute('DESCRIBE ??', [tableName]);
     const [indexes] = await connection.execute('SHOW INDEX FROM ??', [tableName]);
     
@@ -362,7 +398,7 @@ class MySQLMCPServer {
     };
   }
 
-  private async getDatabaseOverview(connection: mysql.Connection, includeRelationships: boolean) {
+  private async getDatabaseOverview(connection: mysql.Connection, databaseName: string | undefined, includeRelationships: boolean) {
     const [tables] = await connection.execute('SHOW TABLES');
     
     if (!includeRelationships) {
@@ -759,105 +795,53 @@ class MySQLMCPServer {
 
   private async handleDiscoverAnalytics(args: any) {
     const connection = await this.createConnection();
-    const { focus_area = 'general', include_recommendations = true } = args;
+    const { 
+      databases, 
+      focus_area = 'general', 
+      include_recommendations = true,
+      cross_database_analysis = true 
+    } = args;
     
+    // First, discover available databases if not specified
+    let targetDatabases = databases;
+    if (!targetDatabases) {
+      const dbQuery = `SHOW DATABASES`;
+      const [dbResult] = await connection.execute(dbQuery);
+      targetDatabases = (dbResult as any[])
+        .map(row => row.Database)
+        .filter(db => !['information_schema', 'performance_schema', 'mysql', 'sys'].includes(db));
+    }
+
     const discovery = {
       executedQueries: [] as string[],
-      database: this.config.database,
+      server: { host: this.config.host, port: this.config.port },
+      analyzedDatabases: targetDatabases,
       focusArea: focus_area,
       discoveryTimestamp: new Date().toISOString(),
-      tables: {} as any,
-      relationships: [] as any[],
+      databases: {} as any,
+      crossDatabaseInsights: [] as any[],
       analyticsInsights: [] as any[],
       recommendedQueries: [] as any[]
     };
 
-    // 1. Discover all tables with comprehensive analysis
-    const tablesQuery = `
-      SELECT 
-        t.TABLE_NAME,
-        t.ENGINE,
-        t.TABLE_ROWS,
-        t.DATA_LENGTH,
-        t.INDEX_LENGTH,
-        t.AUTO_INCREMENT,
-        t.CREATE_TIME,
-        t.UPDATE_TIME,
-        t.TABLE_COMMENT
-      FROM information_schema.TABLES t 
-      WHERE t.TABLE_SCHEMA = ?
-      ORDER BY t.DATA_LENGTH DESC`;
-    
-    discovery.executedQueries.push(tablesQuery);
-    const [tablesResult] = await connection.execute(tablesQuery, [this.config.database]);
-    const tables = tablesResult as any[];
+    discovery.executedQueries.push(`SHOW DATABASES`);
 
-    // 2. Get all relationships in one query
-    const relationshipsQuery = `
-      SELECT 
-        kcu.TABLE_NAME as source_table,
-        kcu.COLUMN_NAME as source_column,
-        kcu.REFERENCED_TABLE_NAME as target_table,
-        kcu.REFERENCED_COLUMN_NAME as target_column,
-        kcu.CONSTRAINT_NAME,
-        rc.UPDATE_RULE,
-        rc.DELETE_RULE
-      FROM information_schema.KEY_COLUMN_USAGE kcu
-      JOIN information_schema.REFERENTIAL_CONSTRAINTS rc 
-        ON kcu.CONSTRAINT_NAME = rc.CONSTRAINT_NAME
-      WHERE kcu.TABLE_SCHEMA = ? 
-        AND kcu.REFERENCED_TABLE_NAME IS NOT NULL`;
-    
-    discovery.executedQueries.push(relationshipsQuery);
-    const [relationshipsResult] = await connection.execute(relationshipsQuery, [this.config.database]);
-    discovery.relationships = relationshipsResult as any[];
-
-    // 3. Analyze each table with intelligent insights
-    for (const table of tables) {
-      const tableName = table.TABLE_NAME;
-      
-      // Get columns with detailed info
-      const columnsQuery = `
-        SELECT 
-          COLUMN_NAME,
-          DATA_TYPE,
-          IS_NULLABLE,
-          COLUMN_KEY,
-          COLUMN_DEFAULT,
-          EXTRA,
-          COLUMN_COMMENT,
-          CHARACTER_MAXIMUM_LENGTH,
-          NUMERIC_PRECISION
-        FROM information_schema.COLUMNS 
-        WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-        ORDER BY ORDINAL_POSITION`;
-      
-      discovery.executedQueries.push(columnsQuery);
-      const [columnsResult] = await connection.execute(columnsQuery, [this.config.database, tableName]);
-      const columns = columnsResult as any[];
-
-      // Get sample data for intelligent analysis
-      const sampleQuery = `SELECT * FROM \`${tableName}\` LIMIT 10`;
-      discovery.executedQueries.push(sampleQuery);
-      const [sampleResult] = await connection.execute(sampleQuery);
-      const sampleData = sampleResult as any[];
-
-      // Intelligent column classification
-      const analysis = this.classifyTableIntelligently(tableName, columns, sampleData, focus_area);
-      
-      discovery.tables[tableName] = {
-        ...table,
-        columns,
-        sampleData: sampleData.slice(0, 5), // Limit sample size in output
-        analysis,
-        insights: this.generateTableInsights(tableName, table, columns, sampleData, discovery.relationships)
-      };
+    // Analyze each database
+    for (const dbName of targetDatabases) {
+      const dbAnalysis = await this.analyzeSingleDatabase(connection, dbName, focus_area);
+      discovery.databases[dbName] = dbAnalysis.database;
+      discovery.executedQueries.push(...dbAnalysis.executedQueries);
     }
 
-    // 4. Generate expert analytics insights
+    // Cross-database analysis
+    if (cross_database_analysis && targetDatabases.length > 1) {
+      discovery.crossDatabaseInsights = this.analyzeCrossDatabasePatterns(discovery.databases);
+    }
+
+    // Generate insights and recommendations
     if (include_recommendations) {
-      discovery.analyticsInsights = this.generateExpertInsights(discovery.tables, discovery.relationships, focus_area);
-      discovery.recommendedQueries = this.generateExpertQueries(discovery.tables, discovery.relationships, focus_area);
+      discovery.analyticsInsights = this.generateMultiDatabaseInsights(discovery.databases, focus_area);
+      discovery.recommendedQueries = this.generateMultiDatabaseQueries(discovery.databases, focus_area);
     }
 
     return {
@@ -1091,6 +1075,255 @@ ORDER BY period`,
         });
       }
     }
+
+    return queries;
+  }
+
+  private async analyzeSingleDatabase(connection: mysql.Connection, databaseName: string, focusArea: string) {
+    const analysis = {
+      database: {
+        name: databaseName,
+        tables: {} as any,
+        relationships: [] as any[],
+        summary: {} as any
+      },
+      executedQueries: [] as string[]
+    };
+
+    // Get all tables for this database
+    const tablesQuery = `
+      SELECT 
+        t.TABLE_NAME,
+        t.ENGINE,
+        t.TABLE_ROWS,
+        t.DATA_LENGTH,
+        t.INDEX_LENGTH,
+        t.AUTO_INCREMENT,
+        t.CREATE_TIME,
+        t.UPDATE_TIME,
+        t.TABLE_COMMENT
+      FROM information_schema.TABLES t 
+      WHERE t.TABLE_SCHEMA = ?
+      ORDER BY t.DATA_LENGTH DESC`;
+    
+    analysis.executedQueries.push(tablesQuery);
+    const [tablesResult] = await connection.execute(tablesQuery, [databaseName]);
+    const tables = tablesResult as any[];
+
+    // Get relationships for this database
+    const relationshipsQuery = `
+      SELECT 
+        kcu.TABLE_NAME as source_table,
+        kcu.COLUMN_NAME as source_column,
+        kcu.REFERENCED_TABLE_NAME as target_table,
+        kcu.REFERENCED_COLUMN_NAME as target_column,
+        kcu.CONSTRAINT_NAME,
+        rc.UPDATE_RULE,
+        rc.DELETE_RULE
+      FROM information_schema.KEY_COLUMN_USAGE kcu
+      JOIN information_schema.REFERENTIAL_CONSTRAINTS rc 
+        ON kcu.CONSTRAINT_NAME = rc.CONSTRAINT_NAME
+      WHERE kcu.TABLE_SCHEMA = ? 
+        AND kcu.REFERENCED_TABLE_NAME IS NOT NULL`;
+    
+    analysis.executedQueries.push(relationshipsQuery);
+    const [relationshipsResult] = await connection.execute(relationshipsQuery, [databaseName]);
+    analysis.database.relationships = relationshipsResult as any[];
+
+    // Analyze each table
+    for (const table of tables) {
+      const tableName = table.TABLE_NAME;
+      
+      // Get columns
+      const columnsQuery = `
+        SELECT 
+          COLUMN_NAME,
+          DATA_TYPE,
+          IS_NULLABLE,
+          COLUMN_KEY,
+          COLUMN_DEFAULT,
+          EXTRA,
+          COLUMN_COMMENT,
+          CHARACTER_MAXIMUM_LENGTH,
+          NUMERIC_PRECISION
+        FROM information_schema.COLUMNS 
+        WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+        ORDER BY ORDINAL_POSITION`;
+      
+      analysis.executedQueries.push(columnsQuery);
+      const [columnsResult] = await connection.execute(columnsQuery, [databaseName, tableName]);
+      const columns = columnsResult as any[];
+
+      // Get sample data
+      const sampleQuery = `SELECT * FROM \`${databaseName}\`.\`${tableName}\` LIMIT 10`;
+      analysis.executedQueries.push(sampleQuery);
+      const [sampleResult] = await connection.execute(sampleQuery);
+      const sampleData = sampleResult as any[];
+
+      // Classify table
+      const tableAnalysis = this.classifyTableIntelligently(tableName, columns, sampleData, focusArea);
+      
+      analysis.database.tables[tableName] = {
+        ...table,
+        database: databaseName,
+        columns,
+        sampleData: sampleData.slice(0, 5),
+        analysis: tableAnalysis,
+        insights: this.generateTableInsights(tableName, table, columns, sampleData, analysis.database.relationships)
+      };
+    }
+
+    // Generate database summary
+    analysis.database.summary = this.generateDatabaseSummary(analysis.database.tables, analysis.database.relationships);
+
+    return analysis;
+  }
+
+  private generateDatabaseSummary(tables: any, relationships: any[]) {
+    const tableNames = Object.keys(tables);
+    const factTables = tableNames.filter(t => tables[t].analysis.relationships.isFactTable);
+    const dimTables = tableNames.filter(t => tables[t].analysis.relationships.isDimensionTable);
+    const userTables = tableNames.filter(t => tables[t].analysis.relationships.isUserTable);
+    const eventTables = tableNames.filter(t => tables[t].analysis.relationships.isEventTable);
+
+    return {
+      totalTables: tableNames.length,
+      factTables: factTables.length,
+      dimensionTables: dimTables.length,
+      userTables: userTables.length,
+      eventTables: eventTables.length,
+      relationships: relationships.length,
+      largestTables: tableNames
+        .sort((a, b) => (tables[b].TABLE_ROWS || 0) - (tables[a].TABLE_ROWS || 0))
+        .slice(0, 5),
+      architecture: factTables.length > 0 ? 'star_schema' : 'normalized'
+    };
+  }
+
+  private analyzeCrossDatabasePatterns(databases: any): any[] {
+    const insights = [];
+    const dbNames = Object.keys(databases);
+    
+    // Look for similar table structures across databases
+    const tablePatterns: any = {};
+    for (const dbName of dbNames) {
+      const tables = Object.keys(databases[dbName].tables);
+      for (const tableName of tables) {
+        if (!tablePatterns[tableName]) tablePatterns[tableName] = [];
+        tablePatterns[tableName].push({
+          database: dbName,
+          analysis: databases[dbName].tables[tableName].analysis
+        });
+      }
+    }
+
+    // Find tables that exist in multiple databases
+    for (const [tableName, instances] of Object.entries(tablePatterns) as [string, any[]][]) {
+      if (instances.length > 1) {
+        insights.push({
+          pattern: 'duplicate_table_structure',
+          table: tableName,
+          databases: instances.map(i => i.database),
+          recommendation: `Table '${tableName}' exists in ${instances.length} databases - consider data partitioning strategy`
+        });
+      }
+    }
+
+    // Look for user data spread across databases
+    const userDatabases = dbNames.filter(db => 
+      databases[db].summary.userTables > 0 || databases[db].summary.eventTables > 0
+    );
+    
+    if (userDatabases.length > 1) {
+      insights.push({
+        pattern: 'distributed_user_data',
+        databases: userDatabases,
+        recommendation: 'User data is distributed across multiple databases - consider cross-database user journey analysis'
+      });
+    }
+
+    return insights;
+  }
+
+  private generateMultiDatabaseInsights(databases: any, focusArea: string): any[] {
+    const insights = [];
+    const dbNames = Object.keys(databases);
+    
+    insights.push({
+      category: 'Server Overview',
+      insight: `Analyzed ${dbNames.length} databases with ${Object.values(databases).reduce((sum: number, db: any) => sum + db.summary.totalTables, 0)} total tables`,
+      recommendation: `Server contains ${dbNames.join(', ')} - use database.table syntax for cross-database queries`
+    });
+
+    // Architecture insights
+    const starSchemas = dbNames.filter(db => databases[db].summary.architecture === 'star_schema');
+    if (starSchemas.length > 0) {
+      insights.push({
+        category: 'Analytics Architecture',
+        insight: `Star schema detected in: ${starSchemas.join(', ')}`,
+        recommendation: 'These databases are optimized for analytical queries and reporting'
+      });
+    }
+
+    if (focusArea === 'user_behavior') {
+      const userDatabases = dbNames.filter(db => databases[db].summary.userTables > 0);
+      if (userDatabases.length > 0) {
+        insights.push({
+          category: 'User Analytics Ready',
+          insight: `User data found in: ${userDatabases.join(', ')}`,
+          recommendation: 'Perfect setup for cross-database user behavior analysis and journey mapping'
+        });
+      }
+    }
+
+    return insights;
+  }
+
+  private generateMultiDatabaseQueries(databases: any, focusArea: string): any[] {
+    const queries = [];
+    const dbNames = Object.keys(databases);
+
+    // Cross-database user analysis
+    if (focusArea === 'user_behavior') {
+      const userDatabases = dbNames.filter(db => databases[db].summary.userTables > 0);
+      const eventDatabases = dbNames.filter(db => databases[db].summary.eventTables > 0);
+
+      if (userDatabases.length > 0 && eventDatabases.length > 0) {
+        queries.push({
+          title: 'Cross-Database User Activity',
+          description: 'Analyze user activity across multiple databases',
+          sql: `-- Example: Cross-database user activity analysis
+-- Adjust database and table names according to your schema
+SELECT 
+  u.user_id,
+  u.email,
+  COUNT(DISTINCT e1.id) as events_db1,
+  COUNT(DISTINCT e2.id) as events_db2
+FROM ${userDatabases[0]}.users u
+LEFT JOIN ${eventDatabases[0]}.events e1 ON u.user_id = e1.user_id
+LEFT JOIN ${eventDatabases.length > 1 ? eventDatabases[1] : eventDatabases[0]}.events e2 ON u.user_id = e2.user_id
+GROUP BY u.user_id, u.email
+ORDER BY (COUNT(DISTINCT e1.id) + COUNT(DISTINCT e2.id)) DESC`,
+          useCase: 'Understanding user engagement across different application components'
+        });
+      }
+    }
+
+    // Database comparison queries
+    queries.push({
+      title: 'Database Size Comparison',
+      description: 'Compare table sizes across databases',
+      sql: `SELECT 
+  TABLE_SCHEMA as database_name,
+  TABLE_NAME,
+  TABLE_ROWS,
+  ROUND((DATA_LENGTH + INDEX_LENGTH) / 1024 / 1024, 2) AS size_mb
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA IN (${dbNames.map(db => `'${db}'`).join(', ')})
+ORDER BY (DATA_LENGTH + INDEX_LENGTH) DESC
+LIMIT 20`,
+      useCase: 'Identifying largest tables for optimization and resource planning'
+    });
 
     return queries;
   }

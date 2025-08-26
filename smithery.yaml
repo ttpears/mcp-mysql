@@ -1,0 +1,96 @@
+name: mysql-mcp-server
+version: "2.0.0"
+description: "Expert MySQL MCP Server with intelligent analytics and multi-database support"
+
+# Build configuration
+build:
+  dockerfile: Dockerfile
+  context: .
+  
+# Runtime configuration
+runtime:
+  platform: node
+  node_version: "18"
+  
+# MCP Server configuration
+mcp:
+  transport: stdio
+  capabilities:
+    - tools
+  
+# Environment variables
+environment:
+  required:
+    - MYSQL_PASSWORD
+  optional:
+    - MYSQL_HOST
+    - MYSQL_PORT
+    - MYSQL_USER
+    - MYSQL_DATABASE
+    - MYSQL_SSL
+    
+# Health check
+health:
+  check: "node -e 'console.log(\"MySQL MCP Server is healthy\")'"
+  interval: 30s
+  timeout: 3s
+  retries: 3
+  
+# Resource limits
+resources:
+  memory: 512Mi
+  cpu: 0.5
+  
+# Security
+security:
+  read_only: true
+  non_root: true
+  
+# Metadata
+metadata:
+  category: database
+  tags:
+    - mysql
+    - analytics
+    - database
+    - mcp
+    - multi-database
+  license: MIT
+  homepage: https://github.com/ttpears/mcp-mysql
+  repository: https://github.com/ttpears/mcp-mysql.git
+  
+# Documentation
+docs:
+  readme: README.md
+  examples:
+    - name: "Server-wide Analytics Discovery"
+      description: "Discover and analyze all databases on a MySQL server"
+      code: |
+        {
+          "tool": "mysql_discover_analytics",
+          "parameters": {
+            "focus_area": "user_behavior",
+            "cross_database_analysis": true
+          }
+        }
+    
+    - name: "Cross-Database Query"  
+      description: "Execute queries across multiple databases"
+      code: |
+        {
+          "tool": "mysql_query",
+          "parameters": {
+            "query": "SELECT u.*, e.event_count FROM db1.users u LEFT JOIN db2.events e ON u.id = e.user_id"
+          }
+        }
+        
+    - name: "Multi-Database Schema Analysis"
+      description: "Analyze schema across specific databases"
+      code: |
+        {
+          "tool": "mysql_discover_analytics", 
+          "parameters": {
+            "databases": ["ecommerce", "analytics", "logs"],
+            "focus_area": "sales_analytics"
+          }
+        }
