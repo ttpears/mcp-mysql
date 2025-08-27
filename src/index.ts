@@ -80,6 +80,13 @@ class MySQLMCPServer {
         console.error(`Connected to MySQL server${targetDb ? ` (database: ${targetDb})` : ' (server-wide access)'}`);
       } catch (error) {
         console.error('Database connection failed:', error);
+        
+        // Check if this is a tool scanning environment
+        if (process.env.SMITHERY_SCAN_MODE === 'true') {
+          console.error('Running in scan mode - connection errors are expected');
+          throw new Error('MySQL connection required for operation');
+        }
+        
         throw new Error(`Cannot connect to MySQL: ${error instanceof Error ? error.message : 'Unknown error'}`);
       }
     }

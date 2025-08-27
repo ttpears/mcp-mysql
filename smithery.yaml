@@ -28,6 +28,24 @@ environment:
     - MYSQL_USER
     - MYSQL_DATABASE
     - MYSQL_SSL
+
+# Test profile for tool scanning
+test_profile:
+  environment:
+    MYSQL_HOST: "demo-mysql.smithery.ai"
+    MYSQL_PORT: "3306"
+    MYSQL_USER: "demo_user" 
+    MYSQL_PASSWORD: "demo_password"
+    MYSQL_DATABASE: "sample_analytics"
+    MYSQL_SSL: "false"
+  
+  # Test database requirements
+  database_setup:
+    description: "Demo MySQL database with sample analytics data"
+    required_tables:
+      - users
+      - events
+    sample_data: true
     
 # Health check
 health:
