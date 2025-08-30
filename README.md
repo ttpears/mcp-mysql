@@ -1,11 +1,12 @@
 # MySQL MCP Server 🚀
 
-An intelligent MySQL MCP Server with expert data analytics capabilities. Goes beyond basic querying to provide comprehensive database analysis, relationship mapping, and user behavior insights.
+An intelligent MySQL MCP Server with expert data analytics capabilities and comprehensive caching. Goes beyond basic querying to provide in-depth database analysis, relationship mapping, and user behavior insights with high-performance caching system.
 
 [![npm version](https://badge.fury.io/js/mysql-mcp-server.svg)](https://badge.fury.io/js/mysql-mcp-server)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Smithery Compatible](https://img.shields.io/badge/Smithery-Compatible-blue.svg)](https://smithery.ai)
 
-## Features
+## ✨ Features
 
 - **🌐 Multi-database server support**: Connect to entire MySQL servers or specific databases
 - **🧠 Intelligent discovery**: Automatic database and table classification with expert insights
@@ -16,6 +17,9 @@ An intelligent MySQL MCP Server with expert data analytics capabilities. Goes be
 - **⚡ Performance optimization**: Query analysis with execution insights and recommendations
 - **🔒 Enterprise security**: Read-only access with query validation and connection timeouts
 - **🏗️ Architecture detection**: Automatic identification of star schemas and data warehouse patterns
+- **⚡ High-performance caching**: Intelligent caching system with TTL support
+- **🚀 Smithery deployment**: Easy deployment with configuration UI on Smithery.ai
+- **🔧 Dual-mode support**: Works as both standalone and Smithery-deployed server
 - **MySQL 5.5+ compatible**: Works with MySQL 5.5 and later versions
 
 ## Quick Start
@@ -42,11 +46,14 @@ claude mcp add mysql-server npm start \
   -e MYSQL_DATABASE=your_database
 ```
 
-### Option 2: Install from Smithery.ai
-```bash
-# Install via Smithery MCP registry
-smithery install mysql-mcp-server
-```
+### Option 2: Deploy on Smithery.ai (Recommended)
+Visit [Smithery.ai MySQL MCP Server](https://smithery.ai/server/@ttpears/mysql-mcp-server) and click "Deploy" for easy setup with configuration UI.
+
+Features when deployed on Smithery:
+- 🎛️ **Configuration UI**: Easy setup with form-based configuration
+- 🔄 **Auto-updates**: Automatic updates when new versions are released
+- ⚡ **High performance**: Optimized deployment with caching enabled
+- 🔒 **Secure**: Environment-based secret management
 
 ### Option 3: Manual Installation
 ```bash
@@ -55,33 +62,54 @@ npm install mysql-mcp-server
 
 ## Configuration
 
-Set the following environment variables:
+### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MYSQL_HOST` | `localhost` | MySQL server hostname |
 | `MYSQL_PORT` | `3306` | MySQL server port |
 | `MYSQL_USER` | `root` | MySQL username |
-| `MYSQL_PASSWORD` | `` | MySQL password |
+| `MYSQL_PASSWORD` | `` | MySQL password (required) |
 | `MYSQL_DATABASE` | _(none)_ | MySQL database name (optional - if not set, provides server-wide access) |
 | `MYSQL_SSL` | `false` | Enable SSL connection |
 
-Examples:
+### Caching Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MCP_MYSQL_CACHE_ENABLED` | `true` | Enable/disable intelligent caching system |
+| `MCP_MYSQL_CACHE_DIR` | `~/.mcp-mysql-cache` | Custom cache directory path |
+| `MCP_MYSQL_CACHE_MAX_SIZE` | `52428800` | Maximum cache file size in bytes (50MB) |
+| `MCP_MYSQL_CACHE_RETENTION_DAYS` | `30` | Days to retain cached files |
+
+### Configuration Examples
+
+**Server-wide access (recommended for analytics):**
 ```bash
-# Server-wide access (recommended for analytics)
 export MYSQL_HOST=localhost
 export MYSQL_PORT=3306
 export MYSQL_USER=analytics_user
 export MYSQL_PASSWORD=your_password
 export MYSQL_SSL=true
+export MCP_MYSQL_CACHE_ENABLED=true
+```
 
-# Single database access
+**Single database access:**
+```bash
 export MYSQL_HOST=localhost
 export MYSQL_PORT=3306
 export MYSQL_USER=readonly_user
 export MYSQL_PASSWORD=your_password
 export MYSQL_DATABASE=your_database
 export MYSQL_SSL=true
+```
+
+**Custom caching configuration:**
+```bash
+export MCP_MYSQL_CACHE_ENABLED=true
+export MCP_MYSQL_CACHE_DIR=/custom/cache/path
+export MCP_MYSQL_CACHE_MAX_SIZE=104857600  # 100MB
+export MCP_MYSQL_CACHE_RETENTION_DAYS=7    # 1 week
 ```
 
 ## Usage
@@ -166,13 +194,17 @@ Analyze table relationships and suggest optimal query patterns for user behavior
 ```
 
 #### `mysql_discover_analytics`
-**🚀 START HERE** - Intelligently discover and analyze your entire MySQL server with expert data analytics insights.
+**🚀 START HERE** - Intelligently discover and analyze your entire MySQL server with expert data analytics insights and intelligent caching.
 
 **Parameters:**
-- `databases` (array, optional): List of databases to analyze (if not specified, discovers all accessible databases)
+- `databases` (array, optional): List of databases to analyze (if not specified, discovers all accessible databases)  
 - `focus_area` (string, optional): Analytics focus ('user_behavior', 'sales_analytics', 'engagement', 'general')
 - `include_recommendations` (boolean, default: true): Include expert query recommendations
 - `cross_database_analysis` (boolean, default: true): Analyze relationships across databases
+- `detail_level` (string, optional): Level of analysis ('summary', 'detailed', 'full')
+- `max_tables_per_db` (number, default: 20): Maximum tables to analyze per database
+- `page` (number, default: 1): Page number for pagination
+- `page_size` (number, default: 5): Number of databases per page
 
 **Examples:**
 ```json
@@ -202,6 +234,32 @@ Analyze table relationships and suggest optimal query patterns for user behavior
 - 📈 Ready-to-use SQL queries for cross-database analytics patterns
 - 🔍 Data quality assessments and optimization suggestions
 - 🏗️ Architecture analysis (star schema detection, data warehouse patterns)
+- ⚡ **High-performance caching**: All results cached with TTL for faster subsequent queries
+- 📄 **Pagination support**: Handle large servers with configurable page sizes
+
+## 🚀 Intelligent Caching System
+
+The server includes a comprehensive caching system that dramatically improves performance for repeated operations:
+
+### Cache Types & TTL
+- **Query Results**: 1-hour TTL - `~/.mcp-mysql-cache/queries/[date]/`
+- **Schema Analysis**: 1-2 hour TTL - `~/.mcp-mysql-cache/schema-snapshots/`
+- **Discovery Reports**: 4-hour TTL - `~/.mcp-mysql-cache/reports/discovery-reports/`
+- **Relationship Analysis**: Cached - `~/.mcp-mysql-cache/reports/relationship-analysis/`
+
+### Cache Features
+- **Automatic TTL management**: Expired cache automatically detected and refreshed
+- **Intelligent key generation**: Complex queries cached with hash-based keys
+- **Size limits**: Configurable maximum file size (default: 50MB)
+- **Storage organization**: Organized by date and operation type
+- **Cache info**: All responses include cache hit/miss information
+- **Cross-session**: Cache persists across server restarts
+
+### Cache Benefits
+- **Faster repeated queries**: Instant responses for cached operations
+- **Reduced database load**: Less strain on your MySQL server
+- **Improved UX**: Near-instantaneous results for complex analytics
+- **Development efficiency**: Quick iterations during data exploration
 
 ## Security Features
 
