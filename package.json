@@ -3,6 +3,7 @@
   "version": "2.1.0",
   "description": "Expert MySQL MCP Server with intelligent analytics and user behavior analysis capabilities",
   "main": "dist/index.js",
+  "module": "./src/index.ts",
   "type": "module",
   "scripts": {
     "build": "tsc",
