@@ -9,6 +9,9 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import mysql from 'mysql2/promise';
 import { z } from 'zod';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
 
 const QueryParamsSchema = z.object({
   query: z.string().min(1, "Query cannot be empty"),
@@ -24,10 +27,24 @@ interface ConnectionConfig {
   ssl?: mysql.SslOptions | string;
 }
 
+interface CacheConfig {
+  enabled: boolean;
+  baseDir: string;
+  maxFileSize: number;
+  retentionDays: number;
+}
+
+interface CacheInfo {
+  enabled: boolean;
+  filePath: string;
+  note: string;
+}
+
 class MySQLMCPServer {
   private server: Server;
   private connection: mysql.Connection | null = null;
   private config: ConnectionConfig;
+  private cacheConfig: CacheConfig;
 
   constructor() {
     this.server = new Server(
@@ -51,7 +68,158 @@ class MySQLMCPServer {
       ssl: process.env.MYSQL_SSL === 'true' ? {} : undefined
     };
 
+    this.cacheConfig = {
+      enabled: process.env.MCP_MYSQL_CACHE_ENABLED !== 'false',
+      baseDir: process.env.MCP_MYSQL_CACHE_DIR || path.join(os.homedir(), '.mcp-mysql-cache'),
+      maxFileSize: parseInt(process.env.MCP_MYSQL_CACHE_MAX_SIZE || '52428800'), // 50MB default
+      retentionDays: parseInt(process.env.MCP_MYSQL_CACHE_RETENTION_DAYS || '30')
+    };
+
     this.setupHandlers();
+  }
+
+  private async ensureCacheDirectory(subDir?: string): Promise<string> {
+    if (!this.cacheConfig.enabled) {
+      throw new Error('Caching is disabled');
+    }
+
+    const targetDir = subDir 
+      ? path.join(this.cacheConfig.baseDir, subDir)
+      : this.cacheConfig.baseDir;
+    
+    await fs.promises.mkdir(targetDir, { recursive: true });
+    return targetDir;
+  }
+
+  private generateCacheFileName(operation: string, database?: string, query?: string): string {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const dbPrefix = database ? `${database}_` : '';
+    const queryHash = query ? `_${this.hashString(query.substring(0, 50))}` : '';
+    return `${timestamp}_${dbPrefix}${operation}${queryHash}.json`;
+  }
+
+  private generateCacheKey(operation: string, database?: string, query?: string): string {
+    const dbPrefix = database ? `${database}_` : '';
+    const queryHash = query ? `_${this.hashString(query)}` : '';
+    return `${dbPrefix}${operation}${queryHash}`;
+  }
+
+  private hashString(str: string): string {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash; // Convert to 32-bit integer
+    }
+    return Math.abs(hash).toString(16);
+  }
+
+  private async readFromCache(
+    operation: string,
+    subDir: string,
+    database?: string,
+    query?: string,
+    ttlHours: number = 1
+  ): Promise<any | null> {
+    if (!this.cacheConfig.enabled) {
+      return null;
+    }
+
+    try {
+      const cacheDir = path.join(this.cacheConfig.baseDir, subDir);
+      const cacheKey = this.generateCacheKey(operation, database, query);
+      
+      // Check if cache directory exists
+      try {
+        await fs.promises.access(cacheDir);
+      } catch {
+        return null;
+      }
+
+      // Find matching cache files
+      const files = await fs.promises.readdir(cacheDir);
+      const matchingFiles = files.filter(file => 
+        file.includes(cacheKey) && file.endsWith('.json')
+      );
+
+      if (matchingFiles.length === 0) {
+        return null;
+      }
+
+      // Sort by timestamp (newest first) and get the latest
+      matchingFiles.sort().reverse();
+      const latestFile = matchingFiles[0];
+      const filePath = path.join(cacheDir, latestFile);
+
+      // Check if file is within TTL
+      const stats = await fs.promises.stat(filePath);
+      const ageHours = (Date.now() - stats.mtime.getTime()) / (1000 * 60 * 60);
+      
+      if (ageHours > ttlHours) {
+        console.error(`Cache expired for ${operation} (${ageHours.toFixed(1)}h old, TTL: ${ttlHours}h)`);
+        return null;
+      }
+
+      // Read and parse cache file
+      const content = await fs.promises.readFile(filePath, 'utf8');
+      const cacheData = JSON.parse(content);
+      
+      console.error(`Cache hit for ${operation} (${ageHours.toFixed(1)}h old): ${filePath}`);
+      return {
+        data: cacheData.data,
+        cacheInfo: {
+          enabled: true,
+          filePath,
+          age: `${ageHours.toFixed(1)} hours`,
+          note: `Loaded from cache (TTL: ${ttlHours}h)`
+        }
+      };
+    } catch (error) {
+      console.error('Failed to read from cache:', error);
+      return null;
+    }
+  }
+
+  private async saveToCache(
+    data: any,
+    operation: string,
+    subDir: string,
+    database?: string,
+    query?: string
+  ): Promise<string | null> {
+    if (!this.cacheConfig.enabled) {
+      return null;
+    }
+
+    try {
+      const cacheDir = await this.ensureCacheDirectory(subDir);
+      const fileName = this.generateCacheFileName(operation, database, query);
+      const filePath = path.join(cacheDir, fileName);
+      
+      const cacheData = {
+        timestamp: new Date().toISOString(),
+        server: { host: this.config.host, port: this.config.port },
+        database: database || 'server',
+        operation,
+        query: query || null,
+        data
+      };
+
+      const content = JSON.stringify(cacheData, null, 2);
+      
+      if (content.length > this.cacheConfig.maxFileSize) {
+        console.error(`Cache file too large (${content.length} bytes), skipping cache for ${operation}`);
+        return null;
+      }
+
+      await fs.promises.writeFile(filePath, content, 'utf8');
+      console.error(`Cached ${operation} results to: ${filePath}`);
+      
+      return filePath;
+    } catch (error) {
+      console.error('Failed to cache data:', error);
+      return null;
+    }
   }
 
   private async createConnection(database?: string): Promise<mysql.Connection> {
@@ -180,7 +348,7 @@ class MySQLMCPServer {
         },
         {
           name: 'mysql_discover_analytics',
-          description: 'Intelligently discover and analyze database structure with expert data analytics insights. Always start with this for new servers.',
+          description: 'Intelligently discover and analyze database structure with expert data analytics insights. Use summary mode first for large servers.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -204,6 +372,39 @@ class MySQLMCPServer {
                 type: 'boolean',
                 description: 'Analyze relationships across databases',
                 default: true
+              },
+              detail_level: {
+                type: 'string',
+                enum: ['summary', 'detailed', 'full'],
+                description: 'Level of detail: summary (overview only), detailed (without sample data), full (everything)',
+                default: 'summary'
+              },
+              max_tables_per_db: {
+                type: 'number',
+                description: 'Maximum number of tables to analyze per database (default: 20)',
+                default: 20,
+                minimum: 1,
+                maximum: 100
+              },
+              sample_data_limit: {
+                type: 'number',
+                description: 'Maximum sample rows per table (default: 3, max: 10)',
+                default: 3,
+                minimum: 0,
+                maximum: 10
+              },
+              page: {
+                type: 'number',
+                description: 'Page number for pagination (1-based, default: 1)',
+                default: 1,
+                minimum: 1
+              },
+              page_size: {
+                type: 'number',
+                description: 'Number of databases to analyze per page (default: 5, max: 10)',
+                default: 5,
+                minimum: 1,
+                maximum: 10
               }
             }
           }
@@ -264,23 +465,43 @@ class MySQLMCPServer {
       const rowCount = Array.isArray(rows) ? rows.length : 0;
       const executionTime = endTime - startTime;
 
+      const resultData: any = {
+        query: {
+          sql: parsed.query,
+          parameters: parsed.params,
+          executionTime: `${executionTime}ms`,
+          rowCount
+        },
+        data: rows,
+        analytics: {
+          summary: `Executed ${parsed.query.trim().split(' ')[0].toUpperCase()} query returning ${rowCount} rows in ${executionTime}ms`,
+          performance: executionTime > 1000 ? 'Consider adding indexes if this query runs frequently' : 'Good performance'
+        }
+      };
+
+      // Cache the query results
+      const cachePath = await this.saveToCache(
+        resultData,
+        'query',
+        `queries/${new Date().toISOString().split('T')[0]}`,
+        args.database,
+        parsed.query
+      );
+
+      // Add cache information to the result if caching succeeded
+      if (cachePath) {
+        resultData.cache = {
+          enabled: true,
+          filePath: cachePath,
+          note: 'Raw MySQL output cached for comprehensive analysis'
+        };
+      }
+
       return {
         content: [
           {
             type: 'text',
-            text: JSON.stringify({
-              query: {
-                sql: parsed.query,
-                parameters: parsed.params,
-                executionTime: `${executionTime}ms`,
-                rowCount
-              },
-              data: rows,
-              analytics: {
-                summary: `Executed ${parsed.query.trim().split(' ')[0].toUpperCase()} query returning ${rowCount} rows in ${executionTime}ms`,
-                performance: executionTime > 1000 ? 'Consider adding indexes if this query runs frequently' : 'Good performance'
-              }
-            }, null, 2)
+            text: JSON.stringify(resultData, null, 2)
           }
         ]
       };
@@ -311,8 +532,32 @@ class MySQLMCPServer {
   }
 
   private async getDetailedTableSchema(connection: mysql.Connection, tableName: string, databaseName: string | undefined, includeRelationships: boolean, includeSampleData: boolean, sampleSize: number) {
-    const [columns] = await connection.execute('DESCRIBE ??', [tableName]);
-    const [indexes] = await connection.execute('SHOW INDEX FROM ??', [tableName]);
+    // Check cache first for schema data (TTL: 1 hour)
+    const cacheKey = `table-${tableName}-${includeRelationships}-${includeSampleData}-${sampleSize}`;
+    const cached = await this.readFromCache(
+      'table-schema',
+      'schema-snapshots',
+      databaseName,
+      cacheKey,
+      1 // 1 hour TTL
+    );
+    
+    if (cached) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              ...cached.data,
+              cache: cached.cacheInfo
+            }, null, 2)
+          }
+        ]
+      };
+    }
+
+    const [columns] = await connection.execute(`DESCRIBE \`${tableName}\``);
+    const [indexes] = await connection.execute(`SHOW INDEX FROM \`${tableName}\``);
     
     let foreignKeys: any[] = [];
     let referencedBy: any[] = [];
@@ -329,7 +574,7 @@ class MySQLMCPServer {
           CONSTRAINT_NAME
         FROM information_schema.KEY_COLUMN_USAGE 
         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND REFERENCED_TABLE_NAME IS NOT NULL
-      `, [this.config.database, tableName]);
+      `, [databaseName || this.config.database, tableName]);
       foreignKeys = foreignKeysResult as any[];
 
       const [referencedByResult] = await connection.execute(`
@@ -339,7 +584,7 @@ class MySQLMCPServer {
           CONSTRAINT_NAME
         FROM information_schema.KEY_COLUMN_USAGE 
         WHERE TABLE_SCHEMA = ? AND REFERENCED_TABLE_NAME = ?
-      `, [this.config.database, tableName]);
+      `, [databaseName || this.config.database, tableName]);
       referencedBy = referencedByResult as any[];
 
       const [constraintsResult] = await connection.execute(`
@@ -351,15 +596,15 @@ class MySQLMCPServer {
         LEFT JOIN information_schema.KEY_COLUMN_USAGE kcu
         ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME 
         WHERE tc.TABLE_SCHEMA = ? AND tc.TABLE_NAME = ?
-      `, [this.config.database, tableName]);
+      `, [databaseName || this.config.database, tableName]);
       constraints = constraintsResult as any[];
     }
 
     if (includeSampleData) {
-      const [rows] = await connection.execute(`SELECT * FROM ?? LIMIT ?`, [tableName, sampleSize]);
+      const [rows] = await connection.execute(`SELECT * FROM \`${tableName}\` LIMIT ?`, [sampleSize]);
       sampleData = rows;
 
-      const [rowCount] = await connection.execute(`SELECT COUNT(*) as total FROM ??`, [tableName]) as any;
+      const [rowCount] = await connection.execute(`SELECT COUNT(*) as total FROM \`${tableName}\``) as any;
       
       dataProfile = {
         totalRows: rowCount[0]?.total || 0,
@@ -384,28 +629,71 @@ class MySQLMCPServer {
       }
     }
 
+    const schemaData: any = {
+      table: tableName,
+      columns,
+      indexes,
+      relationships: {
+        foreignKeys,
+        referencedBy
+      },
+      constraints,
+      ...(dataProfile && { dataProfile }),
+      ...(sampleData && { sampleData })
+    };
+
+    // Cache the schema analysis
+    const cachePath = await this.saveToCache(
+      schemaData,
+      'table-schema',
+      `schema-snapshots`,
+      databaseName,
+      `table-${tableName}`
+    );
+
+    if (cachePath) {
+      schemaData.cache = {
+        enabled: true,
+        filePath: cachePath,
+        note: 'Table schema cached for historical comparison and analysis'
+      };
+    }
+
     return {
       content: [
         {
           type: 'text',
-          text: JSON.stringify({
-            table: tableName,
-            columns,
-            indexes,
-            relationships: {
-              foreignKeys,
-              referencedBy
-            },
-            constraints,
-            ...(dataProfile && { dataProfile }),
-            ...(sampleData && { sampleData })
-          }, null, 2)
+          text: JSON.stringify(schemaData, null, 2)
         }
       ]
     };
   }
 
   private async getDatabaseOverview(connection: mysql.Connection, databaseName: string | undefined, includeRelationships: boolean) {
+    // Check cache first for database overview (TTL: 2 hours)
+    const cacheKey = `overview-${includeRelationships}`;
+    const cached = await this.readFromCache(
+      'database-overview',
+      'schema-snapshots',
+      databaseName,
+      cacheKey,
+      2 // 2 hour TTL for database overviews
+    );
+    
+    if (cached) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              ...cached.data,
+              cache: cached.cacheInfo
+            }, null, 2)
+          }
+        ]
+      };
+    }
+
     const [tables] = await connection.execute('SHOW TABLES');
     
     if (!includeRelationships) {
@@ -428,7 +716,7 @@ class MySQLMCPServer {
         CONSTRAINT_NAME
       FROM information_schema.KEY_COLUMN_USAGE 
       WHERE TABLE_SCHEMA = ? AND REFERENCED_TABLE_NAME IS NOT NULL
-    `, [this.config.database]);
+    `, [databaseName || this.config.database]);
 
     const [tableSizes] = await connection.execute(`
       SELECT 
@@ -438,19 +726,38 @@ class MySQLMCPServer {
       FROM information_schema.TABLES 
       WHERE table_schema = ?
       ORDER BY (data_length + index_length) DESC
-    `, [this.config.database]);
+    `, [databaseName || this.config.database]);
+
+    const overviewData: any = {
+      database: databaseName || this.config.database,
+      tables,
+      tableSizes,
+      relationships,
+      relationshipGraph: this.buildRelationshipGraph(relationships as any[])
+    };
+
+    // Cache the database overview
+    const cachePath = await this.saveToCache(
+      overviewData,
+      'database-overview',
+      `schema-snapshots`,
+      databaseName,
+      'full-overview'
+    );
+
+    if (cachePath) {
+      overviewData.cache = {
+        enabled: true,
+        filePath: cachePath,
+        note: 'Database overview cached for comprehensive analysis'
+      };
+    }
 
     return {
       content: [
         {
           type: 'text',
-          text: JSON.stringify({
-            database: this.config.database,
-            tables,
-            tableSizes,
-            relationships,
-            relationshipGraph: this.buildRelationshipGraph(relationships as any[])
-          }, null, 2)
+          text: JSON.stringify(overviewData, null, 2)
         }
       ]
     };
@@ -531,16 +838,35 @@ class MySQLMCPServer {
     // Analyze join patterns
     const joinSuggestions = this.suggestOptimalJoins(tableInfo, tables);
     
+    const analysisData: any = {
+      analysisType: 'relationships',
+      tables: tableInfo,
+      joinSuggestions,
+      queryRecommendations: this.generateQueryRecommendations(tableInfo, 'relationships')
+    };
+
+    // Cache the relationship analysis
+    const cachePath = await this.saveToCache(
+      analysisData,
+      'table-relationships',
+      `reports/relationship-analysis`,
+      undefined,
+      `tables-${tables.join('_')}`
+    );
+
+    if (cachePath) {
+      analysisData.cache = {
+        enabled: true,
+        filePath: cachePath,
+        note: 'Table relationship analysis cached for cross-reference'
+      };
+    }
+    
     return {
       content: [
         {
           type: 'text',
-          text: JSON.stringify({
-            analysisType: 'relationships',
-            tables: tableInfo,
-            joinSuggestions,
-            queryRecommendations: this.generateQueryRecommendations(tableInfo, 'relationships')
-          }, null, 2)
+          text: JSON.stringify(analysisData, null, 2)
         }
       ]
     };
@@ -806,8 +1132,39 @@ class MySQLMCPServer {
       databases, 
       focus_area = 'general', 
       include_recommendations = true,
-      cross_database_analysis = true 
+      cross_database_analysis = true,
+      detail_level = 'summary',
+      max_tables_per_db = 20,
+      sample_data_limit = 3,
+      page = 1,
+      page_size = 5
     } = args;
+    
+    // Check cache first for discovery analytics (TTL: 4 hours for expensive operations)
+    const sortedDbs = databases ? databases.slice().sort().join('-') : 'all';
+    const cacheKey = `${focus_area}-${detail_level}-p${page}_${page_size}-t${max_tables_per_db}-s${sample_data_limit}`;
+    
+    const cached = await this.readFromCache(
+      'database-discovery',
+      'reports/discovery-reports',
+      sortedDbs,
+      cacheKey,
+      4 // 4 hour TTL for expensive discovery operations
+    );
+    
+    if (cached) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              ...cached.data,
+              cache: cached.cacheInfo
+            }, null, 2)
+          }
+        ]
+      };
+    }
     
     // First, discover available databases if not specified
     let targetDatabases = databases;
@@ -819,10 +1176,31 @@ class MySQLMCPServer {
         .filter(db => !['information_schema', 'performance_schema', 'mysql', 'sys'].includes(db));
     }
 
-    const discovery = {
+    // Calculate pagination
+    const totalDatabases = targetDatabases.length;
+    const totalPages = Math.ceil(totalDatabases / page_size);
+    const startIndex = (page - 1) * page_size;
+    const endIndex = Math.min(startIndex + page_size, totalDatabases);
+    const pagedDatabases = targetDatabases.slice(startIndex, endIndex);
+
+    const discovery: any = {
       executedQueries: [] as string[],
       server: { host: this.config.host, port: this.config.port },
-      analyzedDatabases: targetDatabases,
+      pagination: {
+        currentPage: page,
+        totalPages: totalPages,
+        pageSize: page_size,
+        totalDatabases: totalDatabases,
+        currentPageDatabases: pagedDatabases.length,
+        hasNextPage: page < totalPages,
+        hasPreviousPage: page > 1,
+        nextPageCall: page < totalPages ? {
+          tool: 'mysql_discover_analytics',
+          parameters: { ...args, page: page + 1 }
+        } : null
+      },
+      allDatabases: targetDatabases,
+      analyzedDatabases: pagedDatabases,
       focusArea: focus_area,
       discoveryTimestamp: new Date().toISOString(),
       databases: {} as any,
@@ -833,9 +1211,16 @@ class MySQLMCPServer {
 
     discovery.executedQueries.push(`SHOW DATABASES`);
 
-    // Analyze each database
-    for (const dbName of targetDatabases) {
-      const dbAnalysis = await this.analyzeSingleDatabase(connection, dbName, focus_area);
+    // Analyze each database in the current page
+    for (const dbName of pagedDatabases) {
+      const dbAnalysis = await this.analyzeSingleDatabase(
+        connection, 
+        dbName, 
+        focus_area, 
+        detail_level, 
+        max_tables_per_db, 
+        sample_data_limit
+      );
       discovery.databases[dbName] = dbAnalysis.database;
       discovery.executedQueries.push(...dbAnalysis.executedQueries);
     }
@@ -849,6 +1234,40 @@ class MySQLMCPServer {
     if (include_recommendations) {
       discovery.analyticsInsights = this.generateMultiDatabaseInsights(discovery.databases, focus_area);
       discovery.recommendedQueries = this.generateMultiDatabaseQueries(discovery.databases, focus_area);
+    }
+
+    // Cache the discovery analysis
+    const cachePath = await this.saveToCache(
+      discovery,
+      'database-discovery',
+      `reports/discovery-reports`,
+      sortedDbs,
+      cacheKey
+    );
+
+    if (cachePath) {
+      discovery.cache = {
+        enabled: true,
+        filePath: cachePath,
+        note: 'Complete database discovery analysis cached for comprehensive reporting'
+      };
+    }
+
+    // Check response size and provide guidance if still large
+    const responseText = JSON.stringify(discovery, null, 2);
+    const approximateTokens = Math.ceil(responseText.length / 4); // Rough token estimate
+    
+    if (approximateTokens > 20000) {
+      // Add size warning but return full data
+      (discovery as any).responseInfo = {
+        approximateTokens,
+        sizeWarning: "Large response detected. Consider using smaller page_size or detail_level='summary' for faster processing.",
+        suggestions: [
+          `Use page_size=${Math.max(1, Math.floor(page_size / 2))} for smaller chunks`,
+          "Use detail_level='summary' for overview only",
+          "Filter to specific databases with 'databases' parameter"
+        ]
+      };
     }
 
     return {
@@ -1086,7 +1505,14 @@ ORDER BY period`,
     return queries;
   }
 
-  private async analyzeSingleDatabase(connection: mysql.Connection, databaseName: string, focusArea: string) {
+  private async analyzeSingleDatabase(
+    connection: mysql.Connection, 
+    databaseName: string, 
+    focusArea: string, 
+    detailLevel: string = 'summary',
+    maxTables: number = 20,
+    sampleDataLimit: number = 3
+  ) {
     const analysis = {
       database: {
         name: databaseName,
@@ -1097,7 +1523,7 @@ ORDER BY period`,
       executedQueries: [] as string[]
     };
 
-    // Get all tables for this database
+    // Get all tables for this database (limit for performance)
     const tablesQuery = `
       SELECT 
         t.TABLE_NAME,
@@ -1111,10 +1537,11 @@ ORDER BY period`,
         t.TABLE_COMMENT
       FROM information_schema.TABLES t 
       WHERE t.TABLE_SCHEMA = ?
-      ORDER BY t.DATA_LENGTH DESC`;
+      ORDER BY t.DATA_LENGTH DESC
+      LIMIT ?`;
     
     analysis.executedQueries.push(tablesQuery);
-    const [tablesResult] = await connection.execute(tablesQuery, [databaseName]);
+    const [tablesResult] = await connection.execute(tablesQuery, [databaseName, maxTables]);
     const tables = tablesResult as any[];
 
     // Get relationships for this database
@@ -1137,47 +1564,63 @@ ORDER BY period`,
     const [relationshipsResult] = await connection.execute(relationshipsQuery, [databaseName]);
     analysis.database.relationships = relationshipsResult as any[];
 
-    // Analyze each table
+    // Analyze each table based on detail level
     for (const table of tables) {
       const tableName = table.TABLE_NAME;
       
-      // Get columns
-      const columnsQuery = `
-        SELECT 
-          COLUMN_NAME,
-          DATA_TYPE,
-          IS_NULLABLE,
-          COLUMN_KEY,
-          COLUMN_DEFAULT,
-          EXTRA,
-          COLUMN_COMMENT,
-          CHARACTER_MAXIMUM_LENGTH,
-          NUMERIC_PRECISION
-        FROM information_schema.COLUMNS 
-        WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-        ORDER BY ORDINAL_POSITION`;
+      let columns: any[] = [];
+      let sampleData: any[] = [];
       
-      analysis.executedQueries.push(columnsQuery);
-      const [columnsResult] = await connection.execute(columnsQuery, [databaseName, tableName]);
-      const columns = columnsResult as any[];
+      if (detailLevel !== 'summary') {
+        // Get columns
+        const columnsQuery = `
+          SELECT 
+            COLUMN_NAME,
+            DATA_TYPE,
+            IS_NULLABLE,
+            COLUMN_KEY,
+            COLUMN_DEFAULT,
+            EXTRA,
+            COLUMN_COMMENT,
+            CHARACTER_MAXIMUM_LENGTH,
+            NUMERIC_PRECISION
+          FROM information_schema.COLUMNS 
+          WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+          ORDER BY ORDINAL_POSITION`;
+        
+        analysis.executedQueries.push(columnsQuery);
+        const [columnsResult] = await connection.execute(columnsQuery, [databaseName, tableName]);
+        columns = columnsResult as any[];
 
-      // Get sample data
-      const sampleQuery = `SELECT * FROM \`${databaseName}\`.\`${tableName}\` LIMIT 10`;
-      analysis.executedQueries.push(sampleQuery);
-      const [sampleResult] = await connection.execute(sampleQuery);
-      const sampleData = sampleResult as any[];
+        // Get sample data only for full detail level
+        if (detailLevel === 'full' && sampleDataLimit > 0) {
+          const sampleQuery = `SELECT * FROM \`${databaseName}\`.\`${tableName}\` LIMIT ${sampleDataLimit}`;
+          analysis.executedQueries.push(sampleQuery);
+          const [sampleResult] = await connection.execute(sampleQuery);
+          sampleData = sampleResult as any[];
+        }
+      }
 
-      // Classify table
+      // Classify table (even for summary mode using basic info)
       const tableAnalysis = this.classifyTableIntelligently(tableName, columns, sampleData, focusArea);
       
-      analysis.database.tables[tableName] = {
+      const tableInfo: any = {
         ...table,
         database: databaseName,
-        columns,
-        sampleData: sampleData.slice(0, 5),
-        analysis: tableAnalysis,
-        insights: this.generateTableInsights(tableName, table, columns, sampleData, analysis.database.relationships)
+        analysis: tableAnalysis
       };
+
+      // Add detailed info based on detail level
+      if (detailLevel !== 'summary') {
+        tableInfo.columns = columns;
+        
+        if (detailLevel === 'full') {
+          tableInfo.sampleData = sampleData;
+          tableInfo.insights = this.generateTableInsights(tableName, table, columns, sampleData, analysis.database.relationships);
+        }
+      }
+      
+      analysis.database.tables[tableName] = tableInfo;
     }
 
     // Generate database summary
