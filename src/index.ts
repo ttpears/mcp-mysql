@@ -1817,7 +1817,12 @@ export default function ({ config }: { config: z.infer<typeof configSchema> }) {
 }
 
 // Traditional standalone server mode (when run directly)
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Check if we're running as the main module (works in both ESM and CommonJS)
+const isMainModule = typeof require !== 'undefined' 
+  ? require.main === module 
+  : import.meta.url === `file://${process.argv[1]}`;
+
+if (isMainModule) {
   const server = new MySQLMCPServer();
 
   process.on('SIGINT', async () => {
