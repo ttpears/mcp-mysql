@@ -13,6 +13,17 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 
+// Configuration schema for Smithery
+export const configSchema = z.object({
+  MYSQL_HOST: z.string().default('localhost').describe('MySQL server hostname'),
+  MYSQL_PORT: z.number().default(3306).describe('MySQL server port'),
+  MYSQL_USER: z.string().default('root').describe('MySQL username'),
+  MYSQL_PASSWORD: z.string().describe('MySQL password (required)'),
+  MYSQL_DATABASE: z.string().optional().describe('Default database name (optional)'),
+  MYSQL_SSL: z.boolean().default(false).describe('Enable SSL connection'),
+  MCP_MYSQL_CACHE_ENABLED: z.boolean().default(true).describe('Enable intelligent caching system'),
+});
+
 const QueryParamsSchema = z.object({
   query: z.string().min(1, "Query cannot be empty"),
   params: z.array(z.any()).optional().default([])
@@ -46,11 +57,11 @@ class MySQLMCPServer {
   private config: ConnectionConfig;
   private cacheConfig: CacheConfig;
 
-  constructor() {
+  constructor(userConfig?: Partial<z.infer<typeof configSchema>>) {
     this.server = new Server(
       {
         name: 'mysql-mcp-server',
-        version: '1.0.0',
+        version: '2.1.0',
       },
       {
         capabilities: {
@@ -59,17 +70,20 @@ class MySQLMCPServer {
       }
     );
 
-    this.config = {
-      host: process.env.MYSQL_HOST || 'localhost',
-      port: parseInt(process.env.MYSQL_PORT || '3306'),
-      user: process.env.MYSQL_USER || 'root',
-      password: process.env.MYSQL_PASSWORD || '',
-      database: process.env.MYSQL_DATABASE, // Optional - undefined means server-wide access
-      ssl: process.env.MYSQL_SSL === 'true' ? {} : undefined
+    // Merge user config with environment variables (env vars take precedence)
+    const finalConfig = {
+      host: process.env.MYSQL_HOST || userConfig?.MYSQL_HOST || 'localhost',
+      port: process.env.MYSQL_PORT ? parseInt(process.env.MYSQL_PORT) : (userConfig?.MYSQL_PORT || 3306),
+      user: process.env.MYSQL_USER || userConfig?.MYSQL_USER || 'root',
+      password: process.env.MYSQL_PASSWORD || userConfig?.MYSQL_PASSWORD || '',
+      database: process.env.MYSQL_DATABASE || userConfig?.MYSQL_DATABASE, // Optional
+      ssl: process.env.MYSQL_SSL === 'true' || userConfig?.MYSQL_SSL ? {} : undefined
     };
 
+    this.config = finalConfig;
+
     this.cacheConfig = {
-      enabled: process.env.MCP_MYSQL_CACHE_ENABLED !== 'false',
+      enabled: process.env.MCP_MYSQL_CACHE_ENABLED !== 'false' && (userConfig?.MCP_MYSQL_CACHE_ENABLED !== false),
       baseDir: process.env.MCP_MYSQL_CACHE_DIR || path.join(os.homedir(), '.mcp-mysql-cache'),
       maxFileSize: parseInt(process.env.MCP_MYSQL_CACHE_MAX_SIZE || '52428800'), // 50MB default
       retentionDays: parseInt(process.env.MCP_MYSQL_CACHE_RETENTION_DAYS || '30')
@@ -1778,6 +1792,11 @@ LIMIT 20`,
     return queries;
   }
 
+  // For Smithery compatibility
+  getServer() {
+    return this.server;
+  }
+
   async start() {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
@@ -1791,16 +1810,25 @@ LIMIT 20`,
   }
 }
 
-const server = new MySQLMCPServer();
+// Smithery compatibility export
+export default function ({ config }: { config: z.infer<typeof configSchema> }) {
+  const serverInstance = new MySQLMCPServer(config);
+  return serverInstance.getServer();
+}
 
-process.on('SIGINT', async () => {
-  await server.cleanup();
-  process.exit(0);
-});
+// Traditional standalone server mode (when run directly)
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const server = new MySQLMCPServer();
 
-process.on('SIGTERM', async () => {
-  await server.cleanup();
-  process.exit(0);
-});
+  process.on('SIGINT', async () => {
+    await server.cleanup();
+    process.exit(0);
+  });
 
-server.start().catch(console.error);
+  process.on('SIGTERM', async () => {
+    await server.cleanup();
+    process.exit(0);
+  });
+
+  server.start().catch(console.error);
+}
