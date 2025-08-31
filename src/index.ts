@@ -15,13 +15,15 @@ import os from 'os';
 
 // Configuration schema for Smithery
 export const configSchema = z.object({
-  MYSQL_HOST: z.string().default('localhost').describe('MySQL server hostname'),
-  MYSQL_PORT: z.number().default(3306).describe('MySQL server port'),
-  MYSQL_USER: z.string().default('root').describe('MySQL username'),
-  MYSQL_PASSWORD: z.string().describe('MySQL password (required)'),
+  MYSQL_HOST: z.string().default('localhost').describe('MySQL server hostname (default host)'),
+  MYSQL_PORT: z.number().default(3306).describe('MySQL server port (default host)'),
+  MYSQL_USER: z.string().default('root').describe('MySQL username (default host)'),
+  MYSQL_PASSWORD: z.string().describe('MySQL password (required for default host)'),
   MYSQL_DATABASE: z.string().optional().describe('Default database name (optional)'),
-  MYSQL_SSL: z.boolean().default(false).describe('Enable SSL connection'),
+  MYSQL_SSL: z.boolean().default(false).describe('Enable SSL connection (default host)'),
   MCP_MYSQL_CACHE_ENABLED: z.boolean().default(true).describe('Enable intelligent caching system'),
+  // Multi-host support via environment variables pattern: MYSQL_HOST_<NAME>_*
+  // Example: MYSQL_HOST_PROD_HOST, MYSQL_HOST_PROD_PORT, MYSQL_HOST_PROD_USER, etc.
 });
 
 const QueryParamsSchema = z.object({
@@ -36,6 +38,40 @@ interface ConnectionConfig {
   password: string;
   database?: string; // Optional - if not provided, connects to server with access to all databases
   ssl?: mysql.SslOptions | string;
+}
+
+interface HostConfig extends ConnectionConfig {
+  name: string;
+  isDefault?: boolean;
+}
+
+interface DataSourceClassification {
+  type: 'crm' | 'ecommerce' | 'erp' | 'marketing' | 'support' | 'analytics' | 'warehouse' | 'operational' | 'unknown';
+  businessFunction: string;
+  dataTypes: string[];
+  commonPatterns: string[];
+  estimatedRecords?: number;
+  primaryEntities?: string[];
+}
+
+interface HostInventory {
+  name: string;
+  config: HostConfig;
+  status: 'connected' | 'error' | 'unknown';
+  databases: string[];
+  lastScanned?: Date;
+  error?: string;
+  connectionTest?: {
+    success: boolean;
+    responseTime: number;
+    timestamp: Date;
+  };
+  classification?: DataSourceClassification;
+  federationCapabilities?: {
+    canJoinWith: string[];
+    sharedIdentifiers: string[];
+    commonColumns: { [database: string]: string[] };
+  };
 }
 
 interface CacheConfig {
@@ -53,15 +89,17 @@ interface CacheInfo {
 
 class MySQLMCPServer {
   private server: Server;
-  private connection: mysql.Connection | null = null;
-  private config: ConnectionConfig;
+  private connections: Map<string, mysql.Connection> = new Map();
+  private hostConfigs: Map<string, HostConfig> = new Map();
+  private hostInventory: Map<string, HostInventory> = new Map();
+  private defaultHostName: string = 'default';
   private cacheConfig: CacheConfig;
 
   constructor(userConfig?: Partial<z.infer<typeof configSchema>>) {
     this.server = new Server(
       {
         name: 'mysql-mcp-server',
-        version: '2.1.0',
+        version: '3.0.0',
       },
       {
         capabilities: {
@@ -70,17 +108,7 @@ class MySQLMCPServer {
       }
     );
 
-    // Merge user config with environment variables (env vars take precedence)
-    const finalConfig = {
-      host: process.env.MYSQL_HOST || userConfig?.MYSQL_HOST || 'localhost',
-      port: process.env.MYSQL_PORT ? parseInt(process.env.MYSQL_PORT) : (userConfig?.MYSQL_PORT || 3306),
-      user: process.env.MYSQL_USER || userConfig?.MYSQL_USER || 'root',
-      password: process.env.MYSQL_PASSWORD || userConfig?.MYSQL_PASSWORD || '',
-      database: process.env.MYSQL_DATABASE || userConfig?.MYSQL_DATABASE, // Optional
-      ssl: process.env.MYSQL_SSL === 'true' || userConfig?.MYSQL_SSL ? {} : undefined
-    };
-
-    this.config = finalConfig;
+    this.loadHostConfigurations(userConfig);
 
     this.cacheConfig = {
       enabled: process.env.MCP_MYSQL_CACHE_ENABLED !== 'false' && (userConfig?.MCP_MYSQL_CACHE_ENABLED !== false),
@@ -92,30 +120,391 @@ class MySQLMCPServer {
     this.setupHandlers();
   }
 
-  private async ensureCacheDirectory(subDir?: string): Promise<string> {
+  private loadHostConfigurations(userConfig?: Partial<z.infer<typeof configSchema>>) {
+    // Load default host configuration (backward compatibility)
+    const defaultConfig: HostConfig = {
+      name: this.defaultHostName,
+      host: process.env.MYSQL_HOST || userConfig?.MYSQL_HOST || 'localhost',
+      port: process.env.MYSQL_PORT ? parseInt(process.env.MYSQL_PORT) : (userConfig?.MYSQL_PORT || 3306),
+      user: process.env.MYSQL_USER || userConfig?.MYSQL_USER || 'root',
+      password: process.env.MYSQL_PASSWORD || userConfig?.MYSQL_PASSWORD || '',
+      database: process.env.MYSQL_DATABASE || userConfig?.MYSQL_DATABASE,
+      ssl: process.env.MYSQL_SSL === 'true' || userConfig?.MYSQL_SSL ? {} : undefined,
+      isDefault: true
+    };
+    
+    this.hostConfigs.set(this.defaultHostName, defaultConfig);
+
+    // Load additional host configurations from environment variables
+    // Pattern: MYSQL_HOST_<NAME>_HOST, MYSQL_HOST_<NAME>_PORT, etc.
+    const hostNames = new Set<string>();
+    
+    // Find all host names from environment variables
+    for (const [key] of Object.entries(process.env)) {
+      const match = key.match(/^MYSQL_HOST_([^_]+)_/);
+      if (match) {
+        hostNames.add(match[1].toLowerCase());
+      }
+    }
+
+    // Configure each additional host
+    for (const hostName of hostNames) {
+      const prefix = `MYSQL_HOST_${hostName.toUpperCase()}`;
+      const hostConfig: HostConfig = {
+        name: hostName,
+        host: process.env[`${prefix}_HOST`] || 'localhost',
+        port: process.env[`${prefix}_PORT`] ? parseInt(process.env[`${prefix}_PORT`]!) : 3306,
+        user: process.env[`${prefix}_USER`] || 'root',
+        password: process.env[`${prefix}_PASSWORD`] || '',
+        database: process.env[`${prefix}_DATABASE`],
+        ssl: process.env[`${prefix}_SSL`] === 'true' ? {} : undefined
+      };
+      
+      // Only add if password is provided (required for connection)
+      if (hostConfig.password) {
+        this.hostConfigs.set(hostName, hostConfig);
+      }
+    }
+
+    console.error(`Configured ${this.hostConfigs.size} MySQL host(s): ${Array.from(this.hostConfigs.keys()).join(', ')}`);
+    
+    // Initialize host inventory and scan databases
+    this.initializeHostInventory();
+  }
+
+  private async initializeHostInventory() {
+    console.error('Initializing host inventory and scanning databases...');
+    
+    for (const [hostName, hostConfig] of this.hostConfigs) {
+      const inventory: HostInventory = {
+        name: hostName,
+        config: hostConfig,
+        status: 'unknown',
+        databases: []
+      };
+      
+      this.hostInventory.set(hostName, inventory);
+      
+      // Scan databases in background (don't block initialization)
+      this.scanHostDatabases(hostName).catch(error => {
+        console.error(`Failed to scan databases for host '${hostName}':`, error);
+        inventory.status = 'error';
+        inventory.error = error.message;
+      });
+    }
+  }
+
+  private async scanHostDatabases(hostName: string): Promise<void> {
+    const inventory = this.hostInventory.get(hostName);
+    if (!inventory) return;
+
+    try {
+      const startTime = Date.now();
+      const connection = await this.createConnection(hostName);
+      const responseTime = Date.now() - startTime;
+      
+      // Test connection and get databases
+      const [dbResult] = await connection.execute('SHOW DATABASES');
+      const databases = (dbResult as any[])
+        .map(row => row.Database)
+        .filter(db => !['information_schema', 'performance_schema', 'mysql', 'sys'].includes(db));
+      
+      // Update inventory
+      inventory.status = 'connected';
+      inventory.databases = databases;
+      inventory.lastScanned = new Date();
+      inventory.connectionTest = {
+        success: true,
+        responseTime,
+        timestamp: new Date()
+      };
+      
+      console.error(`✅ Host '${hostName}': Found ${databases.length} databases - ${databases.join(', ')}`);
+      
+      // Classify the data source based on discovered data
+      inventory.classification = await this.classifyDataSource(hostName, databases, connection);
+      inventory.federationCapabilities = await this.analyzeFederationCapabilities(hostName, databases, connection);
+      
+      console.error(`📊 Host '${hostName}': Classified as ${inventory.classification.type} (${inventory.classification.businessFunction})`);
+      
+      // Cache the host inventory
+      await this.cacheHostInventory();
+      
+    } catch (error) {
+      inventory.status = 'error';
+      inventory.error = error instanceof Error ? error.message : 'Unknown error';
+      console.error(`❌ Host '${hostName}': Connection failed - ${inventory.error}`);
+    }
+  }
+
+  private async cacheHostInventory(): Promise<void> {
+    try {
+      const inventoryData = {
+        timestamp: new Date().toISOString(),
+        hosts: Object.fromEntries(
+          Array.from(this.hostInventory.entries()).map(([name, inventory]) => [
+            name,
+            {
+              name: inventory.name,
+              status: inventory.status,
+              databases: inventory.databases,
+              lastScanned: inventory.lastScanned?.toISOString(),
+              connectionTest: inventory.connectionTest,
+              error: inventory.error
+            }
+          ])
+        )
+      };
+
+      await this.saveToCache(
+        inventoryData,
+        'host-inventory',
+        'inventory',
+        undefined,
+        undefined,
+        'all-hosts'
+      );
+    } catch (error) {
+      console.error('Failed to cache host inventory:', error);
+    }
+  }
+
+  public getHostInventory(): Map<string, HostInventory> {
+    return new Map(this.hostInventory);
+  }
+
+  public getAvailableHosts(): string[] {
+    return Array.from(this.hostInventory.keys());
+  }
+
+  public getHostDatabases(hostName?: string): string[] {
+    const targetHost = hostName || this.defaultHostName;
+    const inventory = this.hostInventory.get(targetHost);
+    return inventory ? inventory.databases : [];
+  }
+
+  public getAllDatabasesAcrossHosts(): { host: string, databases: string[] }[] {
+    return Array.from(this.hostInventory.entries())
+      .filter(([, inventory]) => inventory.status === 'connected')
+      .map(([hostName, inventory]) => ({
+        host: hostName,
+        databases: inventory.databases
+      }));
+  }
+
+  private async classifyDataSource(hostName: string, databases: string[], connection: mysql.Connection): Promise<DataSourceClassification> {
+    const classification: DataSourceClassification = {
+      type: 'unknown',
+      businessFunction: 'Unknown',
+      dataTypes: [],
+      commonPatterns: [],
+      primaryEntities: []
+    };
+
+    try {
+      // Analyze table names and structures across databases to classify the data source
+      let allTables: string[] = [];
+      let totalRecords = 0;
+      
+      for (const database of databases) {
+        try {
+          const [tables] = await connection.execute(`SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?`, [database]);
+          const tableNames = (tables as any[]).map(t => t.TABLE_NAME.toLowerCase());
+          allTables = allTables.concat(tableNames);
+          
+          // Get rough record count
+          const [counts] = await connection.execute(`
+            SELECT SUM(TABLE_ROWS) as total_rows 
+            FROM information_schema.TABLES 
+            WHERE TABLE_SCHEMA = ? AND TABLE_ROWS IS NOT NULL
+          `, [database]);
+          totalRecords += (counts as any[])[0]?.total_rows || 0;
+        } catch (error) {
+          // Skip database if we can't access it
+          continue;
+        }
+      }
+      
+      classification.estimatedRecords = totalRecords;
+      
+      // Classification logic based on table patterns
+      const tablePatterns = allTables.join(' ');
+      
+      // CRM System Detection
+      if (this.containsPatterns(tablePatterns, ['lead', 'contact', 'account', 'opportunity', 'campaign']) || 
+          this.containsPatterns(allTables.join(' '), ['sf_', 'salesforce', 'hubspot', 'pipedrive'])) {
+        classification.type = 'crm';
+        classification.businessFunction = 'Customer Relationship Management';
+        classification.dataTypes = ['customers', 'leads', 'opportunities', 'contacts', 'campaigns'];
+        classification.commonPatterns = ['lead_source', 'opportunity_stage', 'contact_status'];
+        classification.primaryEntities = allTables.filter(t => 
+          ['lead', 'contact', 'account', 'opportunity', 'customer'].some(entity => t.includes(entity)));
+      }
+      
+      // E-commerce System Detection
+      else if (this.containsPatterns(tablePatterns, ['order', 'product', 'cart', 'payment', 'inventory']) ||
+               this.containsPatterns(allTables.join(' '), ['woo_', 'shopify', 'magento', 'ecommerce'])) {
+        classification.type = 'ecommerce';
+        classification.businessFunction = 'E-commerce & Retail Operations';
+        classification.dataTypes = ['orders', 'products', 'customers', 'payments', 'inventory'];
+        classification.commonPatterns = ['order_status', 'product_sku', 'payment_method', 'customer_email'];
+        classification.primaryEntities = allTables.filter(t => 
+          ['order', 'product', 'customer', 'payment', 'cart', 'inventory'].some(entity => t.includes(entity)));
+      }
+      
+      // ERP System Detection
+      else if (this.containsPatterns(tablePatterns, ['invoice', 'vendor', 'purchase', 'supplier', 'procurement']) ||
+               this.containsPatterns(allTables.join(' '), ['sap_', 'oracle', 'erp_', 'financial'])) {
+        classification.type = 'erp';
+        classification.businessFunction = 'Enterprise Resource Planning';
+        classification.dataTypes = ['financials', 'procurement', 'inventory', 'hr', 'manufacturing'];
+        classification.commonPatterns = ['invoice_number', 'vendor_id', 'cost_center', 'gl_account'];
+        classification.primaryEntities = allTables.filter(t => 
+          ['invoice', 'vendor', 'purchase', 'employee', 'asset'].some(entity => t.includes(entity)));
+      }
+      
+      // Marketing System Detection
+      else if (this.containsPatterns(tablePatterns, ['campaign', 'email', 'newsletter', 'subscriber', 'segment']) ||
+               this.containsPatterns(allTables.join(' '), ['mailchimp', 'marketo', 'pardot', 'marketing'])) {
+        classification.type = 'marketing';
+        classification.businessFunction = 'Marketing Automation & Analytics';
+        classification.dataTypes = ['campaigns', 'emails', 'subscribers', 'analytics', 'segments'];
+        classification.commonPatterns = ['campaign_id', 'email_status', 'subscriber_status', 'open_rate'];
+        classification.primaryEntities = allTables.filter(t => 
+          ['campaign', 'email', 'subscriber', 'segment', 'list'].some(entity => t.includes(entity)));
+      }
+      
+      // Support System Detection
+      else if (this.containsPatterns(tablePatterns, ['ticket', 'incident', 'support', 'case', 'resolution']) ||
+               this.containsPatterns(allTables.join(' '), ['zendesk', 'freshdesk', 'servicedesk', 'helpdesk'])) {
+        classification.type = 'support';
+        classification.businessFunction = 'Customer Support & Service';
+        classification.dataTypes = ['tickets', 'incidents', 'customers', 'agents', 'knowledge_base'];
+        classification.commonPatterns = ['ticket_status', 'priority', 'category', 'resolution_time'];
+        classification.primaryEntities = allTables.filter(t => 
+          ['ticket', 'incident', 'case', 'agent', 'customer'].some(entity => t.includes(entity)));
+      }
+      
+      // Analytics/Warehouse Detection
+      else if (this.containsPatterns(tablePatterns, ['fact_', 'dim_', 'analytics', 'reporting', 'dashboard']) ||
+               this.containsPatterns(allTables.join(' '), ['warehouse', 'dwh_', 'analytics', 'bi_'])) {
+        classification.type = 'warehouse';
+        classification.businessFunction = 'Data Warehousing & Business Intelligence';
+        classification.dataTypes = ['dimensions', 'facts', 'aggregations', 'metrics', 'kpis'];
+        classification.commonPatterns = ['date_key', 'fact_', 'dim_', 'measure_', 'metric_'];
+        classification.primaryEntities = allTables.filter(t => 
+          t.includes('fact_') || t.includes('dim_') || ['analytics', 'reporting', 'dashboard'].some(entity => t.includes(entity)));
+      }
+      
+      // Operational Database Detection (fallback)
+      else {
+        classification.type = 'operational';
+        classification.businessFunction = 'Operational Database System';
+        classification.dataTypes = ['transactional_data', 'operational_records'];
+        classification.commonPatterns = ['id', 'created_at', 'updated_at', 'status'];
+        classification.primaryEntities = allTables.slice(0, 5); // Top 5 tables
+      }
+      
+    } catch (error) {
+      console.error(`Failed to classify data source '${hostName}':`, error);
+    }
+    
+    return classification;
+  }
+  
+  private containsPatterns(text: string, patterns: string[]): boolean {
+    return patterns.some(pattern => text.toLowerCase().includes(pattern.toLowerCase()));
+  }
+  
+  private async analyzeFederationCapabilities(hostName: string, databases: string[], connection: mysql.Connection): Promise<any> {
+    const capabilities = {
+      canJoinWith: [] as string[],
+      sharedIdentifiers: [] as string[],
+      commonColumns: {} as { [database: string]: string[] }
+    };
+    
+    try {
+      // Look for common identifier patterns that could be used for federation
+      const commonIdentifierPatterns = ['customer_id', 'user_id', 'email', 'customer_email', 'user_email', 'account_id', 'company_id'];
+      
+      for (const database of databases) {
+        try {
+          const [columns] = await connection.execute(`
+            SELECT DISTINCT COLUMN_NAME 
+            FROM information_schema.COLUMNS 
+            WHERE TABLE_SCHEMA = ? 
+              AND COLUMN_NAME REGEXP ?
+          `, [database, '(customer|user|email|account|company)']);
+          
+          const foundColumns = (columns as any[]).map(c => c.COLUMN_NAME.toLowerCase());
+          capabilities.commonColumns[database] = foundColumns;
+          
+          // Add to shared identifiers if we find common patterns
+          foundColumns.forEach(col => {
+            if (commonIdentifierPatterns.some(pattern => col.includes(pattern)) && 
+                !capabilities.sharedIdentifiers.includes(col)) {
+              capabilities.sharedIdentifiers.push(col);
+            }
+          });
+        } catch (error) {
+          // Skip database if we can't access it
+          continue;
+        }
+      }
+      
+      // Determine which other hosts this one can potentially join with
+      for (const [otherHostName, otherInventory] of this.hostInventory) {
+        if (otherHostName !== hostName && otherInventory.federationCapabilities) {
+          const sharedIds = capabilities.sharedIdentifiers.filter(id => 
+            otherInventory.federationCapabilities!.sharedIdentifiers.includes(id)
+          );
+          
+          if (sharedIds.length > 0) {
+            capabilities.canJoinWith.push(otherHostName);
+          }
+        }
+      }
+      
+    } catch (error) {
+      console.error(`Failed to analyze federation capabilities for '${hostName}':`, error);
+    }
+    
+    return capabilities;
+  }
+
+  private async ensureCacheDirectory(subDir?: string, hostName?: string): Promise<string> {
     if (!this.cacheConfig.enabled) {
       throw new Error('Caching is disabled');
     }
 
-    const targetDir = subDir 
-      ? path.join(this.cacheConfig.baseDir, subDir)
-      : this.cacheConfig.baseDir;
+    let targetDir = this.cacheConfig.baseDir;
+    
+    // Add host-specific subdirectory if not default host
+    if (hostName && hostName !== this.defaultHostName) {
+      targetDir = path.join(targetDir, `host-${hostName}`);
+    }
+    
+    if (subDir) {
+      targetDir = path.join(targetDir, subDir);
+    }
     
     await fs.promises.mkdir(targetDir, { recursive: true });
     return targetDir;
   }
 
-  private generateCacheFileName(operation: string, database?: string, query?: string): string {
+  private generateCacheFileName(operation: string, hostName?: string, database?: string, query?: string): string {
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const hostPrefix = hostName && hostName !== this.defaultHostName ? `${hostName}_` : '';
     const dbPrefix = database ? `${database}_` : '';
     const queryHash = query ? `_${this.hashString(query.substring(0, 50))}` : '';
-    return `${timestamp}_${dbPrefix}${operation}${queryHash}.json`;
+    return `${timestamp}_${hostPrefix}${dbPrefix}${operation}${queryHash}.json`;
   }
 
-  private generateCacheKey(operation: string, database?: string, query?: string): string {
+  private generateCacheKey(operation: string, hostName?: string, database?: string, query?: string): string {
+    const hostPrefix = hostName && hostName !== this.defaultHostName ? `${hostName}_` : '';
     const dbPrefix = database ? `${database}_` : '';
     const queryHash = query ? `_${this.hashString(query)}` : '';
-    return `${dbPrefix}${operation}${queryHash}`;
+    return `${hostPrefix}${dbPrefix}${operation}${queryHash}`;
   }
 
   private hashString(str: string): string {
@@ -131,6 +520,7 @@ class MySQLMCPServer {
   private async readFromCache(
     operation: string,
     subDir: string,
+    hostName?: string,
     database?: string,
     query?: string,
     ttlHours: number = 1
@@ -140,8 +530,15 @@ class MySQLMCPServer {
     }
 
     try {
-      const cacheDir = path.join(this.cacheConfig.baseDir, subDir);
-      const cacheKey = this.generateCacheKey(operation, database, query);
+      let cacheDir = this.cacheConfig.baseDir;
+      
+      // Add host-specific subdirectory if not default host
+      if (hostName && hostName !== this.defaultHostName) {
+        cacheDir = path.join(cacheDir, `host-${hostName}`);
+      }
+      
+      cacheDir = path.join(cacheDir, subDir);
+      const cacheKey = this.generateCacheKey(operation, hostName, database, query);
       
       // Check if cache directory exists
       try {
@@ -198,6 +595,7 @@ class MySQLMCPServer {
     data: any,
     operation: string,
     subDir: string,
+    hostName?: string,
     database?: string,
     query?: string
   ): Promise<string | null> {
@@ -206,13 +604,14 @@ class MySQLMCPServer {
     }
 
     try {
-      const cacheDir = await this.ensureCacheDirectory(subDir);
-      const fileName = this.generateCacheFileName(operation, database, query);
+      const cacheDir = await this.ensureCacheDirectory(subDir, hostName);
+      const fileName = this.generateCacheFileName(operation, hostName, database, query);
       const filePath = path.join(cacheDir, fileName);
       
+      const hostConfig = this.getHostConfig(hostName);
       const cacheData = {
         timestamp: new Date().toISOString(),
-        server: { host: this.config.host, port: this.config.port },
+        server: { host: hostConfig.host, port: hostConfig.port, hostName: hostConfig.name },
         database: database || 'server',
         operation,
         query: query || null,
@@ -236,43 +635,73 @@ class MySQLMCPServer {
     }
   }
 
-  private async createConnection(database?: string): Promise<mysql.Connection> {
-    // Create new connection if we need a different database or don't have one
-    const targetDb = database || this.config.database;
+  private getHostConfig(hostName?: string): HostConfig {
+    const targetHost = hostName || this.defaultHostName;
+    const config = this.hostConfigs.get(targetHost);
     
-    if (!this.connection || (targetDb && this.connection.config.database !== targetDb)) {
+    if (!config) {
+      throw new Error(`Host configuration '${targetHost}' not found. Available hosts: ${Array.from(this.hostConfigs.keys()).join(', ')}`);
+    }
+    
+    return config;
+  }
+
+  private async createConnection(hostName?: string, database?: string): Promise<mysql.Connection> {
+    const hostConfig = this.getHostConfig(hostName);
+    const targetDb = database || hostConfig.database;
+    const connectionKey = `${hostConfig.name}:${targetDb || 'default'}`;
+    
+    // Check if we already have a suitable connection
+    const existingConnection = this.connections.get(connectionKey);
+    if (existingConnection) {
       try {
-        const connectionConfig = {
-          ...this.config,
-          timezone: 'Z',
-          dateStrings: true,
-          supportBigNumbers: true,
-          bigNumberStrings: true,
-          connectTimeout: 10000
-        };
-        
-        // Only set database if specified
-        if (targetDb) {
-          connectionConfig.database = targetDb;
-        }
-        
-        this.connection = await mysql.createConnection(connectionConfig);
-        await this.connection.ping();
-        
-        console.error(`Connected to MySQL server${targetDb ? ` (database: ${targetDb})` : ' (server-wide access)'}`);
+        await existingConnection.ping();
+        return existingConnection;
       } catch (error) {
-        console.error('Database connection failed:', error);
-        
-        // Check if this is a tool scanning environment
-        if (process.env.SMITHERY_SCAN_MODE === 'true') {
-          console.error('Running in scan mode - connection errors are expected');
-          throw new Error('MySQL connection required for operation');
-        }
-        
-        throw new Error(`Cannot connect to MySQL: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        // Connection is stale, remove it
+        this.connections.delete(connectionKey);
       }
     }
-    return this.connection;
+
+    // Create new connection
+    try {
+      const connectionConfig = {
+        host: hostConfig.host,
+        port: hostConfig.port,
+        user: hostConfig.user,
+        password: hostConfig.password,
+        ssl: hostConfig.ssl,
+        timezone: 'Z',
+        dateStrings: true,
+        supportBigNumbers: true,
+        bigNumberStrings: true,
+        connectTimeout: 10000
+      };
+      
+      // Only set database if specified
+      if (targetDb) {
+        (connectionConfig as any).database = targetDb;
+      }
+      
+      const connection = await mysql.createConnection(connectionConfig);
+      await connection.ping();
+      
+      // Cache the connection
+      this.connections.set(connectionKey, connection);
+      
+      console.error(`Connected to MySQL ${hostConfig.name} (${hostConfig.host}:${hostConfig.port})${targetDb ? ` database: ${targetDb}` : ' (server-wide access)'}`);
+      return connection;
+    } catch (error) {
+      console.error(`Database connection failed for host '${hostConfig.name}':`, error);
+      
+      // Check if this is a tool scanning environment
+      if (process.env.SMITHERY_SCAN_MODE === 'true') {
+        console.error('Running in scan mode - connection errors are expected');
+        throw new Error('MySQL connection required for operation');
+      }
+      
+      throw new Error(`Cannot connect to MySQL host '${hostConfig.name}': ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   }
 
   private isReadOnlyQuery(query: string): boolean {
@@ -302,6 +731,10 @@ class MySQLMCPServer {
               database: {
                 type: 'string',
                 description: 'Optional database name to connect to for this query'
+              },
+              host: {
+                type: 'string',
+                description: 'Optional host name to connect to (defaults to "default" host)'
               }
             },
             required: ['query']
@@ -320,6 +753,10 @@ class MySQLMCPServer {
               table: {
                 type: 'string',
                 description: 'Optional table name to get specific table analysis (use database.table for cross-database)'
+              },
+              host: {
+                type: 'string',
+                description: 'Optional host name to connect to (defaults to "default" host)'
               },
               include_relationships: {
                 type: 'boolean',
@@ -350,6 +787,10 @@ class MySQLMCPServer {
                 items: { type: 'string' },
                 description: 'List of table names to analyze for relationships'
               },
+              host: {
+                type: 'string',
+                description: 'Optional host name to connect to (defaults to "default" host)'
+              },
               analysis_type: {
                 type: 'string',
                 enum: ['relationships', 'user_behavior', 'data_flow'],
@@ -358,6 +799,60 @@ class MySQLMCPServer {
               }
             },
             required: ['tables']
+          }
+        },
+        {
+          name: 'mysql_inventory',
+          description: 'Get comprehensive inventory of all configured MySQL hosts and their accessible databases.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              refresh: {
+                type: 'boolean',
+                description: 'Force refresh of host inventory by re-scanning all hosts',
+                default: false
+              },
+              host: {
+                type: 'string',
+                description: 'Get inventory for specific host only (omit for all hosts)'
+              }
+            }
+          }
+        },
+        {
+          name: 'mysql_cross_host_query',
+          description: 'Execute queries across multiple MySQL hosts and combine results for comprehensive analysis.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              queries: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    host: { type: 'string', description: 'Host name to execute query on' },
+                    database: { type: 'string', description: 'Database name (optional)' },
+                    query: { type: 'string', description: 'SQL query to execute' },
+                    alias: { type: 'string', description: 'Alias for this query result (optional)' }
+                  },
+                  required: ['host', 'query']
+                },
+                description: 'Array of queries to execute across different hosts'
+              },
+              combine_strategy: {
+                type: 'string',
+                enum: ['separate', 'union', 'comparison', 'correlation'],
+                description: 'How to combine results: separate (individual results), union (merge similar data), comparison (side-by-side), correlation (find relationships)',
+                default: 'separate'
+              },
+              analysis_focus: {
+                type: 'string',
+                enum: ['performance', 'data_consistency', 'user_behavior', 'business_metrics'],
+                description: 'Focus area for cross-host analysis',
+                default: 'data_consistency'
+              }
+            },
+            required: ['queries']
           }
         },
         {
@@ -370,6 +865,10 @@ class MySQLMCPServer {
                 type: 'array',
                 items: { type: 'string' },
                 description: 'Optional list of databases to analyze (if not specified, discovers all accessible databases)'
+              },
+              host: {
+                type: 'string',
+                description: 'Optional host name to connect to (defaults to "default" host)'
               },
               focus_area: {
                 type: 'string',
@@ -441,6 +940,10 @@ class MySQLMCPServer {
             return await this.handleAnalyzeTables(args);
           case 'mysql_discover_analytics':
             return await this.handleDiscoverAnalytics(args);
+          case 'mysql_inventory':
+            return await this.handleInventory(args);
+          case 'mysql_cross_host_query':
+            return await this.handleCrossHostQuery(args);
           default:
             throw new Error(`Unknown tool: ${name}`);
         }
@@ -469,7 +972,7 @@ class MySQLMCPServer {
       throw new Error('Query too long (max 10,000 characters)');
     }
 
-    const connection = await this.createConnection(args.database);
+    const connection = await this.createConnection(args.host, args.database);
     
     try {
       const startTime = Date.now();
@@ -498,6 +1001,7 @@ class MySQLMCPServer {
         resultData,
         'query',
         `queries/${new Date().toISOString().split('T')[0]}`,
+        args.host,
         args.database,
         parsed.query
       );
@@ -510,6 +1014,13 @@ class MySQLMCPServer {
           note: 'Raw MySQL output cached for comprehensive analysis'
         };
       }
+
+      // Add host context information
+      resultData.hostContext = {
+        queriedHost: args.host || 'default',
+        availableHosts: this.getAvailableHosts(),
+        hostDatabases: this.getHostDatabases(args.host)
+      };
 
       return {
         content: [
@@ -526,11 +1037,11 @@ class MySQLMCPServer {
   }
 
   private async handleSchema(args: any) {
-    const connection = await this.createConnection(args?.database);
+    const connection = await this.createConnection(args?.host, args?.database);
     const includeRelationships = args?.include_relationships !== false;
     const includeSampleData = args?.include_sample_data === true;
     const sampleSize = Math.min(args?.sample_size || 100, 1000);
-    const targetDatabase = args?.database || this.config.database;
+    const targetDatabase = args?.database || this.getHostConfig(args?.host).database;
     
     if (args?.table) {
       // Handle database.table format
@@ -539,18 +1050,19 @@ class MySQLMCPServer {
       if (tableName.includes('.')) {
         [dbName, tableName] = tableName.split('.', 2);
       }
-      return await this.getDetailedTableSchema(connection, tableName, dbName, includeRelationships, includeSampleData, sampleSize);
+      return await this.getDetailedTableSchema(connection, tableName, dbName, includeRelationships, includeSampleData, sampleSize, args?.host);
     } else {
-      return await this.getDatabaseOverview(connection, targetDatabase, includeRelationships);
+      return await this.getDatabaseOverview(connection, targetDatabase, includeRelationships, args?.host);
     }
   }
 
-  private async getDetailedTableSchema(connection: mysql.Connection, tableName: string, databaseName: string | undefined, includeRelationships: boolean, includeSampleData: boolean, sampleSize: number) {
+  private async getDetailedTableSchema(connection: mysql.Connection, tableName: string, databaseName: string | undefined, includeRelationships: boolean, includeSampleData: boolean, sampleSize: number, hostName?: string) {
     // Check cache first for schema data (TTL: 1 hour)
     const cacheKey = `table-${tableName}-${includeRelationships}-${includeSampleData}-${sampleSize}`;
     const cached = await this.readFromCache(
       'table-schema',
       'schema-snapshots',
+      hostName,
       databaseName,
       cacheKey,
       1 // 1 hour TTL
@@ -588,7 +1100,7 @@ class MySQLMCPServer {
           CONSTRAINT_NAME
         FROM information_schema.KEY_COLUMN_USAGE 
         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND REFERENCED_TABLE_NAME IS NOT NULL
-      `, [databaseName || this.config.database, tableName]);
+      `, [databaseName || this.getHostConfig(hostName).database, tableName]);
       foreignKeys = foreignKeysResult as any[];
 
       const [referencedByResult] = await connection.execute(`
@@ -598,7 +1110,7 @@ class MySQLMCPServer {
           CONSTRAINT_NAME
         FROM information_schema.KEY_COLUMN_USAGE 
         WHERE TABLE_SCHEMA = ? AND REFERENCED_TABLE_NAME = ?
-      `, [databaseName || this.config.database, tableName]);
+      `, [databaseName || this.getHostConfig(hostName).database, tableName]);
       referencedBy = referencedByResult as any[];
 
       const [constraintsResult] = await connection.execute(`
@@ -610,7 +1122,7 @@ class MySQLMCPServer {
         LEFT JOIN information_schema.KEY_COLUMN_USAGE kcu
         ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME 
         WHERE tc.TABLE_SCHEMA = ? AND tc.TABLE_NAME = ?
-      `, [databaseName || this.config.database, tableName]);
+      `, [databaseName || this.getHostConfig(hostName).database, tableName]);
       constraints = constraintsResult as any[];
     }
 
@@ -661,6 +1173,7 @@ class MySQLMCPServer {
       schemaData,
       'table-schema',
       `schema-snapshots`,
+      hostName,
       databaseName,
       `table-${tableName}`
     );
@@ -683,12 +1196,13 @@ class MySQLMCPServer {
     };
   }
 
-  private async getDatabaseOverview(connection: mysql.Connection, databaseName: string | undefined, includeRelationships: boolean) {
+  private async getDatabaseOverview(connection: mysql.Connection, databaseName: string | undefined, includeRelationships: boolean, hostName?: string) {
     // Check cache first for database overview (TTL: 2 hours)
     const cacheKey = `overview-${includeRelationships}`;
     const cached = await this.readFromCache(
       'database-overview',
       'schema-snapshots',
+      hostName,
       databaseName,
       cacheKey,
       2 // 2 hour TTL for database overviews
@@ -730,7 +1244,7 @@ class MySQLMCPServer {
         CONSTRAINT_NAME
       FROM information_schema.KEY_COLUMN_USAGE 
       WHERE TABLE_SCHEMA = ? AND REFERENCED_TABLE_NAME IS NOT NULL
-    `, [databaseName || this.config.database]);
+    `, [databaseName || this.getHostConfig(hostName).database]);
 
     const [tableSizes] = await connection.execute(`
       SELECT 
@@ -740,10 +1254,10 @@ class MySQLMCPServer {
       FROM information_schema.TABLES 
       WHERE table_schema = ?
       ORDER BY (data_length + index_length) DESC
-    `, [databaseName || this.config.database]);
+    `, [databaseName || this.getHostConfig(hostName).database]);
 
     const overviewData: any = {
-      database: databaseName || this.config.database,
+      database: databaseName || this.getHostConfig(hostName).database,
       tables,
       tableSizes,
       relationships,
@@ -755,6 +1269,7 @@ class MySQLMCPServer {
       overviewData,
       'database-overview',
       `schema-snapshots`,
+      hostName,
       databaseName,
       'full-overview'
     );
@@ -805,7 +1320,7 @@ class MySQLMCPServer {
   }
 
   private async handleAnalyzeTables(args: any) {
-    const connection = await this.createConnection();
+    const connection = await this.createConnection(args.host);
     const { tables, analysis_type = 'relationships' } = args;
     
     if (!Array.isArray(tables) || tables.length === 0) {
@@ -814,7 +1329,7 @@ class MySQLMCPServer {
 
     switch (analysis_type) {
       case 'relationships':
-        return await this.analyzeTableRelationships(connection, tables);
+        return await this.analyzeTableRelationships(connection, tables, args.host);
       case 'user_behavior':
         return await this.analyzeUserBehaviorPatterns(connection, tables);
       case 'data_flow':
@@ -824,7 +1339,7 @@ class MySQLMCPServer {
     }
   }
 
-  private async analyzeTableRelationships(connection: mysql.Connection, tables: string[]) {
+  private async analyzeTableRelationships(connection: mysql.Connection, tables: string[], hostName?: string) {
     const relationships: any[] = [];
     const tableInfo: any = {};
     
@@ -838,7 +1353,7 @@ class MySQLMCPServer {
           CONSTRAINT_NAME
         FROM information_schema.KEY_COLUMN_USAGE 
         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND REFERENCED_TABLE_NAME IS NOT NULL
-      `, [this.config.database, table]);
+      `, [this.getHostConfig().database, table]);
 
       const [rowCount] = await connection.execute(`SELECT COUNT(*) as total FROM ??`, [table]) as any;
       
@@ -864,6 +1379,7 @@ class MySQLMCPServer {
       analysisData,
       'table-relationships',
       `reports/relationship-analysis`,
+      hostName,
       undefined,
       `tables-${tables.join('_')}`
     );
@@ -936,7 +1452,7 @@ class MySQLMCPServer {
           REFERENCED_COLUMN_NAME
         FROM information_schema.KEY_COLUMN_USAGE 
         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND REFERENCED_TABLE_NAME IS NOT NULL
-      `, [this.config.database, table]);
+      `, [this.getHostConfig().database, table]);
       
       const [referencedBy] = await connection.execute(`
         SELECT 
@@ -944,7 +1460,7 @@ class MySQLMCPServer {
           COLUMN_NAME as referencing_column
         FROM information_schema.KEY_COLUMN_USAGE 
         WHERE TABLE_SCHEMA = ? AND REFERENCED_TABLE_NAME = ?
-      `, [this.config.database, table]);
+      `, [this.getHostConfig().database, table]);
 
       flow.tables[table] = {
         columns,
@@ -1140,8 +1656,519 @@ class MySQLMCPServer {
     return recommendations;
   }
 
+  private async handleInventory(args: any) {
+    const { refresh = false, host } = args;
+    
+    // Refresh inventory if requested
+    if (refresh) {
+      console.error('Refreshing host inventory...');
+      const hostsToRefresh = host ? [host] : Array.from(this.hostConfigs.keys());
+      
+      for (const hostName of hostsToRefresh) {
+        await this.scanHostDatabases(hostName);
+      }
+    }
+    
+    // Get inventory data
+    let inventoryData;
+    
+    if (host) {
+      const inventory = this.hostInventory.get(host);
+      if (!inventory) {
+        throw new Error(`Host '${host}' not found. Available hosts: ${this.getAvailableHosts().join(', ')}`);
+      }
+      
+      inventoryData = {
+        requestedHost: host,
+        inventory: {
+          [host]: {
+            name: inventory.name,
+            status: inventory.status,
+            databases: inventory.databases,
+            lastScanned: inventory.lastScanned?.toISOString(),
+            connectionTest: inventory.connectionTest,
+            error: inventory.error,
+            isDefault: inventory.config.isDefault,
+            classification: inventory.classification,
+            federationCapabilities: inventory.federationCapabilities
+          }
+        }
+      };
+    } else {
+      // Return all hosts
+      const allInventory = Object.fromEntries(
+        Array.from(this.hostInventory.entries()).map(([name, inventory]) => [
+          name,
+          {
+            name: inventory.name,
+            status: inventory.status,
+            databases: inventory.databases,
+            lastScanned: inventory.lastScanned?.toISOString(),
+            connectionTest: inventory.connectionTest,
+            error: inventory.error,
+            isDefault: inventory.config.isDefault,
+            host: inventory.config.host,
+            port: inventory.config.port,
+            user: inventory.config.user,
+            classification: inventory.classification,
+            federationCapabilities: inventory.federationCapabilities
+          }
+        ])
+      );
+      
+      inventoryData = {
+        summary: {
+          totalHosts: this.hostInventory.size,
+          connectedHosts: Array.from(this.hostInventory.values()).filter(inv => inv.status === 'connected').length,
+          errorHosts: Array.from(this.hostInventory.values()).filter(inv => inv.status === 'error').length,
+          totalDatabases: Array.from(this.hostInventory.values()).reduce((sum, inv) => sum + inv.databases.length, 0),
+          lastRefresh: new Date().toISOString()
+        },
+        crossHostCapabilities: {
+          canCombineData: true,
+          supportedOperations: ['cross_host_queries', 'multi_host_analysis', 'data_federation'],
+          recommendations: this.generateCrossHostRecommendations()
+        },
+        inventory: allInventory
+      };
+    }
+    
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(inventoryData, null, 2)
+        }
+      ]
+    };
+  }
+
+  private generateCrossHostRecommendations(): string[] {
+    const recommendations = [];
+    const connectedHosts = Array.from(this.hostInventory.values()).filter(inv => inv.status === 'connected');
+    
+    if (connectedHosts.length > 1) {
+      // Business system classification insights
+      const systemTypes = connectedHosts.map(inv => inv.classification?.type).filter(Boolean);
+      const uniqueTypes = [...new Set(systemTypes)];
+      
+      if (uniqueTypes.length > 1) {
+        recommendations.push(`🏢 Enterprise data federation ready: ${uniqueTypes.length} different business systems detected (${uniqueTypes.join(', ')})`);
+        
+        // Specific business intelligence recommendations based on system combinations
+        if (systemTypes.includes('crm') && systemTypes.includes('ecommerce')) {
+          recommendations.push('💰 CRM + E-commerce detected: Perfect for customer journey analysis, lead-to-revenue tracking, and sales funnel optimization.');
+        }
+        
+        if (systemTypes.includes('marketing') && systemTypes.includes('crm')) {
+          recommendations.push('📧 Marketing + CRM integration: Analyze campaign effectiveness, lead quality, and marketing attribution.');
+        }
+        
+        if (systemTypes.includes('support') && (systemTypes.includes('crm') || systemTypes.includes('ecommerce'))) {
+          recommendations.push('🎧 Support system integration: Track customer satisfaction, support impact on retention, and service quality metrics.');
+        }
+        
+        if (systemTypes.includes('erp') && systemTypes.includes('ecommerce')) {
+          recommendations.push('📊 ERP + E-commerce integration: Complete business view from procurement to sales, inventory optimization, and financial reporting.');
+        }
+      }
+      
+      // Federation capability insights
+      const federationPairs = [];
+      for (const host1 of connectedHosts) {
+        if (host1.federationCapabilities?.canJoinWith) {
+          for (const host2Name of host1.federationCapabilities.canJoinWith) {
+            const host2 = connectedHosts.find(h => h.name === host2Name);
+            if (host2) {
+              federationPairs.push(`${host1.name} ↔ ${host2Name}`);
+            }
+          }
+        }
+      }
+      
+      if (federationPairs.length > 0) {
+        recommendations.push(`🔗 Data federation ready: ${federationPairs.join(', ')} can be joined using shared identifiers.`);
+        
+        // Find most common shared identifiers
+        const allSharedIds = connectedHosts.flatMap(h => h.federationCapabilities?.sharedIdentifiers || []);
+        const idCounts = allSharedIds.reduce((acc, id) => { acc[id] = (acc[id] || 0) + 1; return acc; }, {} as any);
+        const topIds = Object.entries(idCounts)
+          .filter(([, count]) => (count as number) > 1)
+          .sort(([, a], [, b]) => (b as number) - (a as number))
+          .slice(0, 3)
+          .map(([id]) => id);
+          
+        if (topIds.length > 0) {
+          recommendations.push(`🔑 Primary join keys available: ${topIds.join(', ')} - use these for cross-source customer/user analysis.`);
+        }
+      }
+      
+      // Data volume insights
+      const totalRecords = connectedHosts.reduce((sum, inv) => sum + (inv.classification?.estimatedRecords || 0), 0);
+      if (totalRecords > 1000000) {
+        recommendations.push(`📈 Large dataset federation: ${totalRecords.toLocaleString()} total records across all sources - consider query optimization and result limiting.`);
+      }
+      
+      // Business use case recommendations
+      recommendations.push('🎯 Recommended federation use cases:');
+      recommendations.push('  • 360° customer view: Combine customer data from all touchpoints');
+      recommendations.push('  • Revenue attribution: Track customer journey from lead to purchase');
+      recommendations.push('  • Operational efficiency: Identify bottlenecks across business processes');
+      recommendations.push('  • Data consistency auditing: Compare data integrity across systems');
+    }
+    
+    return recommendations;
+  }
+
+  private async handleCrossHostQuery(args: any) {
+    const { queries, combine_strategy = 'separate', analysis_focus = 'data_consistency' } = args;
+    
+    if (!Array.isArray(queries) || queries.length === 0) {
+      throw new Error('At least one query is required');
+    }
+    
+    const results: any[] = [];
+    const errors: any[] = [];
+    const executionStats = {
+      startTime: Date.now(),
+      totalQueries: queries.length,
+      successfulQueries: 0,
+      failedQueries: 0,
+      hostsUsed: new Set<string>()
+    };
+    
+    // Execute queries on each host
+    for (let i = 0; i < queries.length; i++) {
+      const queryConfig = queries[i];
+      const { host, database, query, alias } = queryConfig;
+      
+      try {
+        // Validate host exists
+        const hostInventory = this.hostInventory.get(host);
+        if (!hostInventory) {
+          throw new Error(`Host '${host}' not found. Available hosts: ${this.getAvailableHosts().join(', ')}`);
+        }
+        
+        if (hostInventory.status !== 'connected') {
+          throw new Error(`Host '${host}' is not connected (status: ${hostInventory.status})`);
+        }
+        
+        // Validate query is read-only
+        if (!this.isReadOnlyQuery(query)) {
+          throw new Error(`Only read-only queries are allowed. Query ${i + 1} contains write operations.`);
+        }
+        
+        const connection = await this.createConnection(host, database);
+        const queryStartTime = Date.now();
+        const [rows] = await connection.execute(query);
+        const queryEndTime = Date.now();
+        
+        executionStats.hostsUsed.add(host);
+        executionStats.successfulQueries++;
+        
+        results.push({
+          index: i,
+          alias: alias || `query_${i + 1}`,
+          host,
+          database: database || hostInventory.config.database || null,
+          query,
+          data: rows,
+          metadata: {
+            rowCount: Array.isArray(rows) ? rows.length : 0,
+            executionTime: queryEndTime - queryStartTime,
+            timestamp: new Date().toISOString()
+          }
+        });
+        
+      } catch (error) {
+        executionStats.failedQueries++;
+        errors.push({
+          index: i,
+          host,
+          database,
+          query,
+          error: error instanceof Error ? error.message : 'Unknown error'
+        });
+      }
+    }
+    
+    const hostsUsedArray = Array.from(executionStats.hostsUsed);
+    const totalExecutionTime = Date.now() - executionStats.startTime;
+    
+    // Combine results based on strategy
+    let combinedResults;
+    switch (combine_strategy) {
+      case 'union':
+        combinedResults = this.unionResults(results);
+        break;
+      case 'comparison':
+        combinedResults = this.compareResults(results, analysis_focus);
+        break;
+      case 'correlation':
+        combinedResults = this.correlateResults(results, analysis_focus);
+        break;
+      default: // 'separate'
+        combinedResults = { strategy: 'separate', results };
+    }
+    
+    const crossHostAnalysis = {
+      executionSummary: {
+        ...executionStats,
+        totalExecutionTime,
+        hostsUsed: hostsUsedArray
+      },
+      combineStrategy: combine_strategy,
+      analysisFocus: analysis_focus,
+      results: combinedResults,
+      errors: errors.length > 0 ? errors : undefined,
+      insights: this.generateCrossHostInsights(results, analysis_focus),
+      recommendations: this.generateCrossHostQueryRecommendations(results, analysis_focus)
+    };
+    
+    // Cache the cross-host analysis
+    const cachePath = await this.saveToCache(
+      crossHostAnalysis,
+      'cross-host-query',
+      'reports/cross-host-analysis',
+      'multi-host',
+      undefined,
+      `${combine_strategy}-${Date.now()}`
+    );
+    
+    if (cachePath) {
+      (crossHostAnalysis as any).cache = {
+        enabled: true,
+        filePath: cachePath,
+        note: 'Cross-host query analysis cached for future reference'
+      };
+    }
+    
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(crossHostAnalysis, null, 2)
+        }
+      ]
+    };
+  }
+  
+  private unionResults(results: any[]): any {
+    if (results.length === 0) return { strategy: 'union', combinedData: [] };
+    
+    // Simple union - combine all data arrays
+    const combinedData = results.reduce((acc, result) => {
+      if (Array.isArray(result.data)) {
+        return acc.concat(result.data.map((row: any) => ({ ...row, _source_host: result.host, _source_alias: result.alias })));
+      }
+      return acc;
+    }, []);
+    
+    return {
+      strategy: 'union',
+      combinedData,
+      totalRows: combinedData.length,
+      sources: results.map(r => ({ host: r.host, alias: r.alias, rowCount: r.metadata.rowCount }))
+    };
+  }
+  
+  private compareResults(results: any[], focus: string): any {
+    const comparison = {
+      strategy: 'comparison',
+      focus,
+      results: results.map(r => ({
+        host: r.host,
+        alias: r.alias,
+        rowCount: r.metadata.rowCount,
+        executionTime: r.metadata.executionTime,
+        sampleData: Array.isArray(r.data) ? r.data.slice(0, 3) : []
+      })),
+      analysis: {
+        rowCountComparison: results.map(r => ({ host: r.host, rows: r.metadata.rowCount })),
+        performanceComparison: results.map(r => ({ host: r.host, executionTime: r.metadata.executionTime }))
+      }
+    };
+    
+    if (focus === 'performance') {
+      (comparison.analysis as any).performanceInsights = this.analyzePerformanceDifferences(results);
+    }
+    
+    return comparison;
+  }
+  
+  private correlateResults(results: any[], focus: string): any {
+    // Basic correlation analysis
+    const correlation = {
+      strategy: 'correlation',
+      focus,
+      patterns: [],
+      insights: []
+    };
+    
+    if (results.length >= 2) {
+      // Look for common columns across results
+      const columnSets = results.map(r => {
+        if (Array.isArray(r.data) && r.data.length > 0) {
+          return Object.keys(r.data[0]);
+        }
+        return [];
+      });
+      
+      if (columnSets.length > 1) {
+        const commonColumns = columnSets[0].filter(col => 
+          columnSets.every(set => set.includes(col))
+        );
+        
+        (correlation as any).commonColumns = commonColumns;
+        (correlation as any).insights.push(`Found ${commonColumns.length} common columns across hosts: ${commonColumns.join(', ')}`);
+      }
+    }
+    
+    return correlation;
+  }
+  
+  private analyzePerformanceDifferences(results: any[]): string[] {
+    const insights = [];
+    const times = results.map(r => r.metadata.executionTime);
+    const avgTime = times.reduce((sum, time) => sum + time, 0) / times.length;
+    
+    const slowHost = results.reduce((prev, current) => 
+      (prev.metadata.executionTime > current.metadata.executionTime) ? prev : current
+    );
+    
+    const fastHost = results.reduce((prev, current) => 
+      (prev.metadata.executionTime < current.metadata.executionTime) ? prev : current
+    );
+    
+    if (slowHost.metadata.executionTime > avgTime * 1.5) {
+      insights.push(`Host '${slowHost.host}' is significantly slower (${slowHost.metadata.executionTime}ms vs ${avgTime.toFixed(0)}ms avg)`);
+    }
+    
+    if (fastHost.metadata.executionTime < avgTime * 0.5) {
+      insights.push(`Host '${fastHost.host}' shows excellent performance (${fastHost.metadata.executionTime}ms)`);
+    }
+    
+    return insights;
+  }
+  
+  private generateCrossHostInsights(results: any[], focus: string): string[] {
+    const insights = [];
+    
+    if (results.length > 1) {
+      const hostsUsed = results.map(r => r.host);
+      const hostClassifications = hostsUsed.map(host => {
+        const inventory = this.hostInventory.get(host);
+        return inventory?.classification?.type || 'unknown';
+      });
+      
+      insights.push(`🔗 Federated query across ${hostsUsed.length} business systems: ${hostsUsed.map((host, i) => `${host} (${hostClassifications[i]})`).join(', ')}`);
+      
+      const totalRows = results.reduce((sum, r) => sum + r.metadata.rowCount, 0);
+      insights.push(`📊 Combined enterprise dataset: ${totalRows.toLocaleString()} total records federated across business systems`);
+      
+      // Business-specific insights based on system types involved
+      const systemTypes = [...new Set(hostClassifications.filter(t => t !== 'unknown'))];
+      if (systemTypes.length > 1) {
+        insights.push(`💼 Multi-system analysis: Combining data from ${systemTypes.join(' + ')} systems enables comprehensive business intelligence`);
+      }
+      
+      if (focus === 'data_consistency') {
+        // Analyze data consistency across business systems
+        const rowCounts = results.map(r => r.metadata.rowCount);
+        const maxRows = Math.max(...rowCounts);
+        const minRows = Math.min(...rowCounts);
+        
+        if (maxRows > minRows * 2) {
+          insights.push(`⚠️  Data volume variance detected: ${maxRows.toLocaleString()} vs ${minRows.toLocaleString()} records - may indicate data sync issues between systems`);
+        } else {
+          insights.push('✅ Data volumes are consistent across business systems - good data integration');
+        }
+        
+        // Performance insights across systems
+        const performanceTimes = results.map(r => ({ host: r.host, time: r.metadata.executionTime }));
+        const avgTime = performanceTimes.reduce((sum, p) => sum + p.time, 0) / performanceTimes.length;
+        const slowSystems = performanceTimes.filter(p => p.time > avgTime * 1.5);
+        
+        if (slowSystems.length > 0) {
+          insights.push(`🐌 Performance bottlenecks: ${slowSystems.map(s => s.host).join(', ')} showing slower response times - consider system optimization`);
+        }
+      }
+      
+      if (focus === 'user_behavior') {
+        insights.push('👥 Cross-system user behavior analysis ready - ideal for 360° customer journey mapping and attribution modeling');
+      }
+      
+      if (focus === 'business_metrics') {
+        insights.push('📈 Multi-source business intelligence: Perfect for comprehensive KPI reporting and cross-functional analytics');
+      }
+    }
+    
+    return insights;
+  }
+  
+  private generateCrossHostQueryRecommendations(results: any[], focus: string): string[] {
+    const recommendations = [];
+    
+    if (results.length > 1) {
+      const hostsUsed = results.map(r => r.host);
+      const systemTypes = hostsUsed.map(host => {
+        const inventory = this.hostInventory.get(host);
+        return inventory?.classification?.type;
+      }).filter(Boolean);
+      
+      // Data combination strategies
+      recommendations.push('🔗 Federation Strategies:');
+      recommendations.push('  • Use correlation strategy to find relationships between business systems');
+      recommendations.push('  • Use comparison strategy to identify data consistency issues');
+      recommendations.push('  • Use union strategy to create comprehensive business datasets');
+      
+      // Business-specific recommendations
+      if (focus === 'user_behavior' || systemTypes.some(t => ['crm', 'ecommerce', 'marketing'].includes(t!))) {
+        recommendations.push('👥 Customer Intelligence Recommendations:');
+        recommendations.push('  • JOIN customer data using email, customer_id, or user_id across systems');
+        recommendations.push('  • Create customer lifetime value by combining CRM leads, e-commerce purchases, and support interactions');
+        recommendations.push('  • Track customer journey from marketing campaign → lead → opportunity → purchase → support');
+        recommendations.push('  • Build customer segmentation using cross-system behavioral data');
+      }
+      
+      if (focus === 'business_metrics' || systemTypes.some(t => ['erp', 'ecommerce', 'warehouse'].includes(t!))) {
+        recommendations.push('📊 Business Intelligence Recommendations:');
+        recommendations.push('  • Create executive dashboards combining financial (ERP) + sales (e-commerce) + operational data');
+        recommendations.push('  • Build end-to-end process analytics from procurement → inventory → sales → finance');
+        recommendations.push('  • Implement real-time business health monitoring across all systems');
+        recommendations.push('  • Use time-based partitioning (daily/monthly) for historical trend analysis');
+      }
+      
+      if (systemTypes.includes('support')) {
+        recommendations.push('🎧 Customer Experience Recommendations:');
+        recommendations.push('  • Correlate support ticket volume with sales/marketing activities');
+        recommendations.push('  • Analyze customer health score combining purchase history + support interactions');
+        recommendations.push('  • Track resolution efficiency impact on customer retention');
+      }
+      
+      // Technical optimization recommendations
+      const totalRows = results.reduce((sum, r) => sum + r.metadata.rowCount, 0);
+      if (totalRows > 100000) {
+        recommendations.push('⚡ Performance Optimization:');
+        recommendations.push('  • Use LIMIT clauses for large dataset exploration');
+        recommendations.push('  • Consider time-based filtering (last 30/90 days) for faster queries');
+        recommendations.push('  • Use aggregate functions (COUNT, SUM, AVG) instead of retrieving all records');
+        recommendations.push('  • Cache frequently accessed cross-system reports');
+      }
+      
+      // Data quality recommendations
+      recommendations.push('🔍 Data Quality Best Practices:');
+      recommendations.push('  • Validate shared identifiers (customer_id, email) exist in all systems');
+      recommendations.push('  • Check for data freshness discrepancies between systems');
+      recommendations.push('  • Monitor for duplicate records when combining datasets');
+      recommendations.push('  • Use consistent date/time formats across system queries');
+    }
+    
+    return recommendations;
+  }
+
   private async handleDiscoverAnalytics(args: any) {
-    const connection = await this.createConnection();
+    const connection = await this.createConnection(args.host);
     const { 
       databases, 
       focus_area = 'general', 
@@ -1161,6 +2188,7 @@ class MySQLMCPServer {
     const cached = await this.readFromCache(
       'database-discovery',
       'reports/discovery-reports',
+      args.host,
       sortedDbs,
       cacheKey,
       4 // 4 hour TTL for expensive discovery operations
@@ -1199,7 +2227,7 @@ class MySQLMCPServer {
 
     const discovery: any = {
       executedQueries: [] as string[],
-      server: { host: this.config.host, port: this.config.port },
+      server: { host: this.getHostConfig(args.host).host, port: this.getHostConfig(args.host).port },
       pagination: {
         currentPage: page,
         totalPages: totalPages,
@@ -1255,6 +2283,7 @@ class MySQLMCPServer {
       discovery,
       'database-discovery',
       `reports/discovery-reports`,
+      args.host,
       sortedDbs,
       cacheKey
     );
@@ -1804,9 +2833,16 @@ LIMIT 20`,
   }
 
   async cleanup() {
-    if (this.connection) {
-      await this.connection.end();
+    // Close all active connections
+    for (const [key, connection] of this.connections.entries()) {
+      try {
+        await connection.end();
+        console.error(`Closed connection: ${key}`);
+      } catch (error) {
+        console.error(`Error closing connection ${key}:`, error);
+      }
     }
+    this.connections.clear();
   }
 }
 

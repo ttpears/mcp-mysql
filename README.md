@@ -1,6 +1,6 @@
 # MySQL MCP Server 🚀
 
-An intelligent MySQL MCP Server with expert data analytics capabilities and comprehensive caching. Goes beyond basic querying to provide in-depth database analysis, relationship mapping, and user behavior insights with high-performance caching system.
+An intelligent MySQL MCP Server with **enterprise data federation** capabilities, enabling LLMs to query and analyze data across multiple disparate MySQL data sources. Goes beyond basic querying to provide comprehensive business intelligence, cross-system data correlation, and federated analytics with high-performance caching.
 
 [![npm version](https://badge.fury.io/js/mysql-mcp-server.svg)](https://badge.fury.io/js/mysql-mcp-server)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -8,18 +8,26 @@ An intelligent MySQL MCP Server with expert data analytics capabilities and comp
 
 ## ✨ Features
 
-- **🌐 Multi-database server support**: Connect to entire MySQL servers or specific databases
-- **🧠 Intelligent discovery**: Automatic database and table classification with expert insights
-- **📊 Advanced analytics**: Comprehensive schema analysis with relationships and constraints
-- **👥 User behavior specialization**: Smart detection of user, time, and behavior patterns
-- **🔄 Cross-database analysis**: Relationship mapping and insights across multiple databases
-- **📈 Ready-to-use queries**: AI-generated analytics templates for common patterns
-- **⚡ Performance optimization**: Query analysis with execution insights and recommendations
+### 🏢 **Enterprise Data Federation**
+- **🌐 Multi-source MySQL access**: Connect to completely different business systems (CRM, ERP, E-commerce, etc.)
+- **🧠 Intelligent source classification**: Automatically identify and catalog CRM, E-commerce, ERP, Marketing, Support systems
+- **🔗 Cross-source query engine**: Execute federated queries combining data from multiple business systems
+- **📊 360° business intelligence**: Complete customer view across all touchpoints and systems
+- **🔍 Relationship detection**: Find connections between disparate systems (shared customer IDs, etc.)
+
+### 📈 **Advanced Analytics & Intelligence**
+- **👥 User behavior federation**: Track customers across CRM → Marketing → E-commerce → Support journey
+- **💼 Business process analytics**: End-to-end analysis from procurement → inventory → sales → finance
+- **🎯 Revenue attribution**: Multi-touch attribution across marketing, sales, and customer systems
+- **🔄 Data consistency auditing**: Compare and validate data integrity across business systems
+- **📈 Cross-system KPI reporting**: Unified executive dashboards combining all business data
+
+### ⚡ **Performance & Enterprise Features**
+- **🚀 High-performance caching**: Source-specific intelligent caching with TTL support
 - **🔒 Enterprise security**: Read-only access with query validation and connection timeouts
 - **🏗️ Architecture detection**: Automatic identification of star schemas and data warehouse patterns
-- **⚡ High-performance caching**: Intelligent caching system with TTL support
+- **🔧 Connection pooling**: Efficient connection management across multiple business systems
 - **🚀 Smithery deployment**: Easy deployment with configuration UI on Smithery.ai
-- **🔧 Dual-mode support**: Works as both standalone and Smithery-deployed server
 - **MySQL 5.5+ compatible**: Works with MySQL 5.5 and later versions
 
 ## Quick Start
@@ -64,14 +72,29 @@ npm install mysql-mcp-server
 
 ### Environment Variables
 
+#### Default Data Source
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MYSQL_HOST` | `localhost` | MySQL server hostname |
-| `MYSQL_PORT` | `3306` | MySQL server port |
-| `MYSQL_USER` | `root` | MySQL username |
-| `MYSQL_PASSWORD` | `` | MySQL password (required) |
-| `MYSQL_DATABASE` | _(none)_ | MySQL database name (optional - if not set, provides server-wide access) |
-| `MYSQL_SSL` | `false` | Enable SSL connection |
+| `MYSQL_HOST` | `localhost` | MySQL server hostname (default source) |
+| `MYSQL_PORT` | `3306` | MySQL server port (default source) |
+| `MYSQL_USER` | `root` | MySQL username (default source) |
+| `MYSQL_PASSWORD` | `` | MySQL password (required for default source) |
+| `MYSQL_DATABASE` | _(none)_ | MySQL database name (optional - server-wide access if omitted) |
+| `MYSQL_SSL` | `false` | Enable SSL connection (default source) |
+
+#### Multi-Source Data Federation
+For additional business system data sources, use pattern: `MYSQL_HOST_<SOURCE>_*`
+
+| Pattern | Example | Description |
+|---------|---------|-------------|
+| `MYSQL_HOST_<SOURCE>_HOST` | `MYSQL_HOST_CRM_HOST` | Hostname for the data source |
+| `MYSQL_HOST_<SOURCE>_PORT` | `MYSQL_HOST_CRM_PORT` | Port for the data source (default: 3306) |
+| `MYSQL_HOST_<SOURCE>_USER` | `MYSQL_HOST_CRM_USER` | Username for the data source (default: root) |
+| `MYSQL_HOST_<SOURCE>_PASSWORD` | `MYSQL_HOST_CRM_PASSWORD` | Password for the data source (required) |
+| `MYSQL_HOST_<SOURCE>_DATABASE` | `MYSQL_HOST_CRM_DATABASE` | Database name for the data source (optional) |
+| `MYSQL_HOST_<SOURCE>_SSL` | `MYSQL_HOST_CRM_SSL` | Enable SSL for the data source (default: false) |
+
+**Note**: Each additional data source requires at least `MYSQL_HOST_<SOURCE>_HOST` and `MYSQL_HOST_<SOURCE>_PASSWORD` to be configured.
 
 ### Caching Configuration
 
@@ -84,17 +107,45 @@ npm install mysql-mcp-server
 
 ### Configuration Examples
 
-**Server-wide access (recommended for analytics):**
+**Enterprise data federation setup:**
 ```bash
+# Default data source (backward compatible)
 export MYSQL_HOST=localhost
 export MYSQL_PORT=3306
 export MYSQL_USER=analytics_user
 export MYSQL_PASSWORD=your_password
 export MYSQL_SSL=true
 export MCP_MYSQL_CACHE_ENABLED=true
+
+# CRM System (Salesforce MySQL backend)
+export MYSQL_HOST_CRM_HOST=crm-db.company.com
+export MYSQL_HOST_CRM_USER=crm_readonly
+export MYSQL_HOST_CRM_PASSWORD=crm_secret
+export MYSQL_HOST_CRM_DATABASE=salesforce_sync
+export MYSQL_HOST_CRM_SSL=true
+
+# E-commerce Platform (Shopify/WooCommerce)
+export MYSQL_HOST_ECOMMERCE_HOST=shop-db.company.com
+export MYSQL_HOST_ECOMMERCE_USER=ecommerce_analytics
+export MYSQL_HOST_ECOMMERCE_PASSWORD=shop_secret
+export MYSQL_HOST_ECOMMERCE_DATABASE=store_analytics
+
+# ERP System (SAP/Oracle MySQL interface)
+export MYSQL_HOST_ERP_HOST=erp-mysql.company.com
+export MYSQL_HOST_ERP_USER=erp_reporting
+export MYSQL_HOST_ERP_PASSWORD=erp_secret
+
+# Marketing & Support Systems
+export MYSQL_HOST_MARKETING_HOST=marketing-db.company.com
+export MYSQL_HOST_MARKETING_USER=marketing_readonly
+export MYSQL_HOST_MARKETING_PASSWORD=marketing_secret
+
+export MYSQL_HOST_SUPPORT_HOST=support-db.company.com
+export MYSQL_HOST_SUPPORT_USER=support_analytics
+export MYSQL_HOST_SUPPORT_PASSWORD=support_secret
 ```
 
-**Single database access:**
+**Single database access (legacy mode):**
 ```bash
 export MYSQL_HOST=localhost
 export MYSQL_PORT=3306
@@ -122,18 +173,90 @@ npm start
 
 ### Available Tools
 
+#### `mysql_inventory`
+**🏢 START HERE** - Get comprehensive inventory of all configured business systems and their databases.
+
+**Parameters:**
+- `refresh` (boolean, optional): Force refresh of data source inventory
+- `host` (string, optional): Get inventory for specific data source only
+
+**Examples:**
+```json
+// Get complete enterprise data source inventory
+{}
+
+// Refresh and get inventory for specific source
+{
+  "host": "crm",
+  "refresh": true
+}
+```
+
+**What you get:**
+- 🏢 Business system classification (CRM, E-commerce, ERP, Marketing, Support, etc.)
+- 📊 Database inventory with record counts and connection health
+- 🔗 Federation capabilities and shared identifiers across systems
+- 💡 Cross-system analysis recommendations
+
+#### `mysql_cross_host_query`
+**🚀 ENTERPRISE POWER TOOL** - Execute federated queries across multiple business systems.
+
+**Parameters:**
+- `queries` (array, required): Array of queries to execute across different data sources
+  - `host` (string, required): Data source name to execute query on
+  - `database` (string, optional): Database name within the data source
+  - `query` (string, required): SQL query to execute
+  - `alias` (string, optional): Alias for this query result
+- `combine_strategy` (string, optional): How to combine results ('separate', 'union', 'comparison', 'correlation')
+- `analysis_focus` (string, optional): Focus area ('performance', 'data_consistency', 'user_behavior', 'business_metrics')
+
+**Example - 360° Customer Intelligence:**
+```json
+{
+  "queries": [
+    {
+      "host": "crm",
+      "query": "SELECT customer_id, email, lead_source FROM customers WHERE status = 'active'",
+      "alias": "crm_customers"
+    },
+    {
+      "host": "ecommerce",
+      "query": "SELECT customer_email as email, SUM(order_total) as lifetime_value FROM orders GROUP BY customer_email",
+      "alias": "purchase_history"
+    },
+    {
+      "host": "support",
+      "query": "SELECT requester_email as email, COUNT(*) as ticket_count FROM tickets GROUP BY requester_email",
+      "alias": "support_interactions"
+    }
+  ],
+  "combine_strategy": "correlation",
+  "analysis_focus": "user_behavior"
+}
+```
+
 #### `mysql_query`
-Execute read-only SQL queries against the database.
+Execute read-only SQL queries against specific data sources.
 
 **Parameters:**
 - `query` (string, required): SQL query to execute
 - `params` (array, optional): Parameters for prepared statements
+- `database` (string, optional): Database name to connect to
+- `host` (string, optional): Data source name (defaults to 'default')
 
-**Example:**
+**Examples:**
 ```json
+// Query default data source
 {
   "query": "SELECT * FROM users WHERE status = ?",
   "params": ["active"]
+}
+
+// Query specific business system
+{
+  "host": "crm",
+  "database": "salesforce_sync",
+  "query": "SELECT COUNT(*) as total_leads FROM leads WHERE created_date >= '2024-01-01'"
 }
 ```
 
