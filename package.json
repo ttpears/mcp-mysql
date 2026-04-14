@@ -1,5 +1,5 @@
 {
-  "name": "@ttpears/mcp-mysql",
+  "name": "@ttpears/mysql-mcp",
   "version": "3.0.0",
   "description": "Expert MySQL MCP Server with intelligent analytics and user behavior analysis capabilities",
   "main": "dist/index.js",

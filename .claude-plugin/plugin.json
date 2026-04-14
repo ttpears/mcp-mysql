@@ -1,18 +1,18 @@
 {
-  "name": "mcp-mysql",
+  "name": "mysql-mcp",
   "description": "MySQL MCP server with analytics and user behavior analysis",
   "version": "3.0.0",
   "author": {
     "name": "Tim Pearson"
   },
-  "homepage": "https://github.com/ttpears/mcp-mysql",
-  "repository": "https://github.com/ttpears/mcp-mysql",
+  "homepage": "https://github.com/ttpears/mysql-mcp",
+  "repository": "https://github.com/ttpears/mysql-mcp",
   "license": "MIT",
   "keywords": ["mcp", "mysql", "analytics", "sql"],
   "mcpServers": {
     "mysql": {
       "command": "npx",
-      "args": ["-y", "@ttpears/mcp-mysql"]
+      "args": ["-y", "@ttpears/mysql-mcp"]
     }
   }
 }
