@@ -1,16 +1,23 @@
 {
-  "name": "mysql-mcp-server",
+  "name": "@ttpears/mcp-mysql",
   "version": "3.0.0",
   "description": "Expert MySQL MCP Server with intelligent analytics and user behavior analysis capabilities",
   "main": "dist/index.js",
   "module": "./src/index.ts",
   "type": "module",
+  "bin": {
+    "mcp-mysql": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js", 
     "dev": "tsx src/index.ts",
-    "prepare": "npm run build",
-    "postinstall": "npm run build"
+    "prepublishOnly": "npm run build"
   },
   "keywords": [
     "mcp", 
@@ -25,6 +32,9 @@
   ],
   "author": "ttpears",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/ttpears/mcp-mysql.git"
