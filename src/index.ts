@@ -120,26 +120,132 @@ class MySQLMCPServer {
     this.setupHandlers();
   }
 
+  private parseMyCnf(filePath: string): Record<string, Record<string, string>> {
+    const sections: Record<string, Record<string, string>> = {};
+    let raw: string;
+    try {
+      raw = fs.readFileSync(filePath, 'utf8');
+    } catch {
+      return sections;
+    }
+
+    let current: string | null = null;
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith(';')) continue;
+      if (trimmed.startsWith('!')) continue; // !include / !includedir not supported
+
+      const sectionMatch = trimmed.match(/^\[([^\]]+)\]$/);
+      if (sectionMatch) {
+        current = sectionMatch[1].trim().toLowerCase();
+        if (!sections[current]) sections[current] = {};
+        continue;
+      }
+
+      if (!current) continue;
+
+      const eq = trimmed.indexOf('=');
+      let key: string;
+      let value: string;
+      if (eq === -1) {
+        key = trimmed;
+        value = '';
+      } else {
+        key = trimmed.slice(0, eq).trim();
+        value = trimmed.slice(eq + 1).trim();
+      }
+
+      // Strip inline comments (MySQL: # starts a comment outside quotes)
+      if (value && !/^['"]/.test(value)) {
+        const hashIdx = value.indexOf('#');
+        if (hashIdx >= 0) value = value.slice(0, hashIdx).trim();
+      }
+
+      // Strip surrounding quotes
+      if (value.length >= 2) {
+        const first = value[0];
+        const last = value[value.length - 1];
+        if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+          value = value.slice(1, -1);
+        }
+      }
+
+      // Normalize key: MySQL treats - and _ as equivalent
+      key = key.toLowerCase().replace(/-/g, '_');
+      sections[current][key] = value;
+    }
+
+    return sections;
+  }
+
+  private hostConfigFromCnfSection(
+    name: string,
+    section: Record<string, string>,
+    isDefault = false
+  ): HostConfig {
+    const sslVal = section['ssl'] || section['ssl_mode'];
+    const sslEnabled = sslVal !== undefined && sslVal !== '' && sslVal.toLowerCase() !== 'disabled' && sslVal.toLowerCase() !== 'false' && sslVal !== '0';
+    return {
+      name,
+      host: section['host'] || 'localhost',
+      port: section['port'] ? parseInt(section['port']) : 3306,
+      user: section['user'] || 'root',
+      password: section['password'] || '',
+      database: section['database'],
+      ssl: sslEnabled ? {} : undefined,
+      isDefault
+    };
+  }
+
   private loadHostConfigurations(userConfig?: Partial<z.infer<typeof configSchema>>) {
-    // Load default host configuration (backward compatibility)
+    // Parse ~/.my.cnf if present; used as a fallback source for credentials.
+    const myCnfPath = path.join(os.homedir(), '.my.cnf');
+    const ignoreMyCnf = process.env.MCP_MYSQL_IGNORE_MY_CNF === 'true';
+    const myCnf = ignoreMyCnf ? {} : this.parseMyCnf(myCnfPath);
+
+    if (Object.keys(myCnf).length > 0) {
+      const hasPassword = Object.values(myCnf).some(s => s['password']);
+      console.error('');
+      console.error('⚠️  WARNING: Auto-loading MySQL credentials from ~/.my.cnf');
+      console.error(`   File: ${myCnfPath}`);
+      console.error(`   Sections: ${Object.keys(myCnf).join(', ')}`);
+      if (hasPassword) {
+        console.error('   This file contains passwords that will be used by the MCP server.');
+      }
+      console.error('   Environment variables (MYSQL_*) take precedence over ~/.my.cnf values.');
+      console.error('   To disable, set MCP_MYSQL_IGNORE_MY_CNF=true');
+      console.error('');
+    } else if (ignoreMyCnf && fs.existsSync(myCnfPath)) {
+      console.error(`MCP_MYSQL_IGNORE_MY_CNF=true — skipping ${myCnfPath}`);
+    }
+
+    const clientSection = myCnf['client'] || {};
+
+    const cnfSslVal = clientSection['ssl'] || clientSection['ssl_mode'];
+    const cnfSslEnabled = cnfSslVal !== undefined && cnfSslVal !== '' && cnfSslVal.toLowerCase() !== 'disabled' && cnfSslVal.toLowerCase() !== 'false' && cnfSslVal !== '0';
+
+    // Load default host configuration.
+    // Precedence: env var > userConfig > ~/.my.cnf [client] > hardcoded default.
     const defaultConfig: HostConfig = {
       name: this.defaultHostName,
-      host: process.env.MYSQL_HOST || userConfig?.MYSQL_HOST || 'localhost',
-      port: process.env.MYSQL_PORT ? parseInt(process.env.MYSQL_PORT) : (userConfig?.MYSQL_PORT || 3306),
-      user: process.env.MYSQL_USER || userConfig?.MYSQL_USER || 'root',
-      password: process.env.MYSQL_PASSWORD || userConfig?.MYSQL_PASSWORD || '',
-      database: process.env.MYSQL_DATABASE || userConfig?.MYSQL_DATABASE,
-      ssl: process.env.MYSQL_SSL === 'true' || userConfig?.MYSQL_SSL ? {} : undefined,
+      host: process.env.MYSQL_HOST || userConfig?.MYSQL_HOST || clientSection['host'] || 'localhost',
+      port: process.env.MYSQL_PORT
+        ? parseInt(process.env.MYSQL_PORT)
+        : (userConfig?.MYSQL_PORT || (clientSection['port'] ? parseInt(clientSection['port']) : 3306)),
+      user: process.env.MYSQL_USER || userConfig?.MYSQL_USER || clientSection['user'] || 'root',
+      password: process.env.MYSQL_PASSWORD || userConfig?.MYSQL_PASSWORD || clientSection['password'] || '',
+      database: process.env.MYSQL_DATABASE || userConfig?.MYSQL_DATABASE || clientSection['database'],
+      ssl: (process.env.MYSQL_SSL === 'true' || userConfig?.MYSQL_SSL || cnfSslEnabled) ? {} : undefined,
       isDefault: true
     };
-    
+
     this.hostConfigs.set(this.defaultHostName, defaultConfig);
 
-    // Load additional host configurations from environment variables
-    // Pattern: MYSQL_HOST_<NAME>_HOST, MYSQL_HOST_<NAME>_PORT, etc.
+    // Discover named hosts from env vars (MYSQL_HOST_<NAME>_*) and from my.cnf
+    // sections matching [client<name>] / [client-<name>] / [client_<name>]
+    // (the --defaults-group-suffix convention).
     const hostNames = new Set<string>();
-    
-    // Find all host names from environment variables
+
     for (const [key] of Object.entries(process.env)) {
       const match = key.match(/^MYSQL_HOST_([^_]+)_/);
       if (match) {
@@ -147,20 +253,35 @@ class MySQLMCPServer {
       }
     }
 
-    // Configure each additional host
+    const cnfNamedSections: Record<string, Record<string, string>> = {};
+    for (const [sectionName, values] of Object.entries(myCnf)) {
+      const m = sectionName.match(/^client[-_]?(.+)$/);
+      if (!m) continue;
+      const named = m[1].toLowerCase();
+      cnfNamedSections[named] = values;
+      hostNames.add(named);
+    }
+
     for (const hostName of hostNames) {
       const prefix = `MYSQL_HOST_${hostName.toUpperCase()}`;
+      const cnf = cnfNamedSections[hostName] || {};
+      const sslEnv = process.env[`${prefix}_SSL`];
+      const cnfSsl = cnf['ssl'] || cnf['ssl_mode'];
+      const cnfSslOn = cnfSsl !== undefined && cnfSsl !== '' && cnfSsl.toLowerCase() !== 'disabled' && cnfSsl.toLowerCase() !== 'false' && cnfSsl !== '0';
+
       const hostConfig: HostConfig = {
         name: hostName,
-        host: process.env[`${prefix}_HOST`] || 'localhost',
-        port: process.env[`${prefix}_PORT`] ? parseInt(process.env[`${prefix}_PORT`]!) : 3306,
-        user: process.env[`${prefix}_USER`] || 'root',
-        password: process.env[`${prefix}_PASSWORD`] || '',
-        database: process.env[`${prefix}_DATABASE`],
-        ssl: process.env[`${prefix}_SSL`] === 'true' ? {} : undefined
+        host: process.env[`${prefix}_HOST`] || cnf['host'] || 'localhost',
+        port: process.env[`${prefix}_PORT`]
+          ? parseInt(process.env[`${prefix}_PORT`]!)
+          : (cnf['port'] ? parseInt(cnf['port']) : 3306),
+        user: process.env[`${prefix}_USER`] || cnf['user'] || 'root',
+        password: process.env[`${prefix}_PASSWORD`] || cnf['password'] || '',
+        database: process.env[`${prefix}_DATABASE`] || cnf['database'],
+        ssl: (sslEnv === 'true' || (sslEnv === undefined && cnfSslOn)) ? {} : undefined
       };
-      
-      // Only add if password is provided (required for connection)
+
+      // Only register if a password is available (required to connect).
       if (hostConfig.password) {
         this.hostConfigs.set(hostName, hostConfig);
       }
