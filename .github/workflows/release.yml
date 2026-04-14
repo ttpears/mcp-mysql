@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   release:
@@ -15,17 +16,21 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           registry-url: "https://registry.npmjs.org"
+
+      # Trusted publishing requires npm >= 11.5.1; Node 22 ships with npm 10.x.
+      - run: npm install -g npm@latest
 
       - run: npm ci
       - run: npm run build
 
-      - name: Publish to npm
-        run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish to npm with provenance
+        # Uses npm trusted publishing via GitHub OIDC (id-token: write).
+        # No NPM_TOKEN needed — npm CLI exchanges the Actions OIDC token
+        # for a short-lived registry token at publish time.
+        run: npm publish --access public --provenance
 
       - name: Create GitHub Release
         env:
