@@ -37,11 +37,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/ttpears/mcp-mysql.git"
+    "url": "git+https://github.com/ttpears/mysql-mcp.git"
   },
-  "homepage": "https://github.com/ttpears/mcp-mysql#readme",
+  "homepage": "https://github.com/ttpears/mysql-mcp#readme",
   "bugs": {
-    "url": "https://github.com/ttpears/mcp-mysql/issues"
+    "url": "https://github.com/ttpears/mysql-mcp/issues"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
