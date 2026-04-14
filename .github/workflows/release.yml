@@ -20,17 +20,14 @@ jobs:
           cache: npm
           registry-url: "https://registry.npmjs.org"
 
-      # Trusted publishing requires npm >= 11.5.1; Node 22 ships with npm 10.x.
-      - run: npm install -g npm@latest
-
       - run: npm ci
       - run: npm run build
 
       - name: Publish to npm with provenance
-        # Uses npm trusted publishing via GitHub OIDC (id-token: write).
-        # No NPM_TOKEN needed — npm CLI exchanges the Actions OIDC token
-        # for a short-lived registry token at publish time.
-        run: npm publish --access public --provenance
+        # Trusted publishing requires npm >= 11.5.1; Node 22 ships with npm 10.x,
+        # and `npm install -g npm@latest` has a self-upgrade bug on Node 22, so
+        # invoke a fresh npm via npx for the publish step only.
+        run: npx -y npm@latest publish --access public --provenance
 
       - name: Create GitHub Release
         env:
